@@ -6,6 +6,20 @@
 
 ## 📸 Pipeline in Action
 
+### Step 1 & 2 — Reference Face Input & ArcFace Embedding
+*Live local face detection via InsightFace ArcFace — 512-dimensional vector embedding generated locally on CPU (confidence: 0.851)*
+
+![Reference Face Input & Embedding](docs/screenshots/00_ui_home.png)
+
+---
+
+### Step 3 — Live Visual Web Search
+*Real automated reverse-image search via Yandex Visual Search / Chromium engine — discovering live web instances in seconds*
+
+![Live Visual Search](docs/screenshots/00b_upload_and_search.png)
+
+---
+
 ### Step 4 — Candidate Analysis
 *15 web images discovered, 14 downloaded, 12 human faces found, 12 passing threshold*
 
