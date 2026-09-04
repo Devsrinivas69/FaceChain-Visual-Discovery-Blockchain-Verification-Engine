@@ -1,9 +1,10 @@
 """Google Lens visual search provider using browser automation."""
 
 import logging
+import os
 import time
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -15,6 +16,7 @@ from config import (
 )
 from extraction.url_utils import extract_domain, normalize_url
 from .base import SearchCandidate, SearchProvider
+from .models import SearchResponse, SearchStatus
 
 logger = logging.getLogger(__name__)
 
@@ -29,167 +31,220 @@ GOOGLE_INTERNAL_DOMAINS = {
     "accounts.google.com",
 }
 
+CHROMIUM_SERVER_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-blink-features=AutomationControlled",
+]
+
+
 class GoogleLensProvider(SearchProvider):
     """Executes live visual reverse-image search via Google Lens."""
 
     @property
     def name(self) -> str:
-        return "google_lens"
+        return "google"
 
-    def search(self, image_path: str) -> List[SearchCandidate]:
+    def search_detailed(self, image_path: str) -> SearchResponse:
+        t0 = time.time()
+        logger.info("SELECTED PROVIDER: google")
+        logger.info("NORMALIZED PROVIDER: google")
+        logger.info("PROVIDER IMPLEMENTATION: GoogleLensProvider")
+
         path_obj = Path(image_path).resolve()
         if not path_obj.is_file():
-            raise FileNotFoundError(f"Input image does not exist: {path_obj}")
+            err_msg = f"Input image does not exist: {path_obj}"
+            return SearchResponse(
+                provider="google",
+                status=SearchStatus.UNAVAILABLE,
+                elapsed_seconds=round(time.time() - t0, 2),
+                error=err_msg,
+            )
+
+        is_render = bool(os.getenv("RENDER") or os.getenv("SERVER_SOFTWARE"))
+        use_headless = True if (is_render or os.name != "nt") else SEARCH_HEADLESS
 
         candidates: List[SearchCandidate] = []
         seen_urls = set()
+        raw_count = 0
+        diagnostics: Dict[str, Any] = {
+            "headless": use_headless,
+            "render_detected": is_render,
+        }
 
-        logger.info("Launching Playwright Chromium for Google Lens visual search...")
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=SEARCH_HEADLESS,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-gpu",
-                    "--no-sandbox",
-                ],
-            )
-            context = browser.new_context(
-                user_agent=USER_AGENT,
-                viewport={"width": 1280, "height": 900},
-                accept_downloads=False,
-            )
-            page = context.new_page()
-
-            try:
-                # Approach A: Direct upload page
-                logger.info("Navigating to Google Lens upload interface...")
+        try:
+            with sync_playwright() as p:
                 try:
-                    page.goto("https://lens.google.com/upload", timeout=SEARCH_TIMEOUT_MS, wait_until="domcontentloaded")
-                except Exception as e:
-                    logger.warning(f"Lens upload page slow/errored ({e}), trying images.google.com...")
-                    page.goto("https://images.google.com", timeout=SEARCH_TIMEOUT_MS, wait_until="domcontentloaded")
+                    browser = p.chromium.launch(
+                        headless=use_headless,
+                        args=CHROMIUM_SERVER_ARGS,
+                    )
+                except Exception as b_err:
+                    err = f"Failed to launch Chromium for Google Lens: {b_err}"
+                    logger.error(err)
+                    return SearchResponse(
+                        provider="google",
+                        status=SearchStatus.BROWSER_ERROR,
+                        elapsed_seconds=round(time.time() - t0, 2),
+                        error=err,
+                        diagnostics=diagnostics,
+                    )
 
-                # Handle consent / cookie popups if present
-                self._dismiss_consent_popups(page)
+                context = browser.new_context(
+                    user_agent=USER_AGENT,
+                    viewport={"width": 1280, "height": 900},
+                    accept_downloads=False,
+                )
+                page = context.new_page()
 
-                # Locate file input
-                file_input = page.query_selector('input[type="file"]')
-                if not file_input:
-                    # If on images.google.com, click camera icon first
-                    camera_btn = page.query_selector('div[aria-label*="Search by image"], button[aria-label*="Search by image"], [data-base-lens-url]')
-                    if camera_btn:
-                        camera_btn.click()
-                        page.wait_for_timeout(1000)
-                        file_input = page.query_selector('input[type="file"]')
-
-                if not file_input:
-                    logger.warning("Could not find file upload input on Google page.")
-                    return []
-
-                logger.info(f"Uploading query image: {path_obj.name}")
-                file_input.set_input_files(str(path_obj))
-
-                # Wait for search results container
-                logger.info("Waiting for Google Lens visual results...")
-                page.wait_for_timeout(3000)
-
-                # Wait for result links or images
                 try:
-                    page.wait_for_selector('a[href^="http"]', timeout=SEARCH_TIMEOUT_MS)
-                except PlaywrightTimeoutError:
-                    logger.warning("Timeout waiting for result links in Google Lens.")
+                    logger.info("Navigating to Google Lens interface...")
+                    try:
+                        page.goto("https://lens.google.com/upload", timeout=SEARCH_TIMEOUT_MS, wait_until="domcontentloaded")
+                    except Exception as e:
+                        logger.warning(f"Lens upload page slow ({e}), fallback to images.google.com...")
+                        page.goto("https://images.google.com", timeout=SEARCH_TIMEOUT_MS, wait_until="domcontentloaded")
 
-                # Extra settle time for dynamic JavaScript rendering
-                page.wait_for_timeout(2500)
+                    self._dismiss_consent_popups(page)
 
-                # Extract candidate anchors and elements
-                # Google Lens renders cards containing links to source pages and preview thumbnails
-                links_data = page.evaluate("""
-                    () => {
+                    # Check for bot challenge
+                    if "sorry/index" in page.url or "recaptcha" in page.content().lower():
+                        return SearchResponse(
+                            provider="google",
+                            status=SearchStatus.PROVIDER_BLOCKED,
+                            elapsed_seconds=round(time.time() - t0, 2),
+                            error="Google presented a CAPTCHA/unusual traffic challenge.",
+                        )
+
+                    file_input = page.query_selector('input[type="file"]')
+                    if not file_input:
+                        camera_btn = page.query_selector('div[aria-label*="Search by image"], button[aria-label*="Search by image"], [data-base-lens-url]')
+                        if camera_btn:
+                            camera_btn.click()
+                            page.wait_for_timeout(1000)
+                            file_input = page.query_selector('input[type="file"]')
+
+                    if not file_input:
+                        return SearchResponse(
+                            provider="google",
+                            status=SearchStatus.PARSER_FAILURE,
+                            elapsed_seconds=round(time.time() - t0, 2),
+                            error="Could not locate image upload element on Google Lens.",
+                        )
+
+                    logger.info(f"Uploading query image: {path_obj.name}")
+                    file_input.set_input_files(str(path_obj))
+                    page.wait_for_timeout(4000)
+
+                    try:
+                        page.wait_for_selector('a[href^="http"]', timeout=15000)
+                    except PlaywrightTimeoutError:
+                        pass
+
+                    page.wait_for_timeout(2500)
+
+                    links_data = page.evaluate("""() => {
                         const results = [];
-                        // Select all external links in result containers
                         const anchors = Array.from(document.querySelectorAll('a[href^="http"]'));
                         for (const a of anchors) {
                             const href = a.href;
                             if (!href) continue;
-
-                            // Skip google domains
                             try {
                                 const urlObj = new URL(href);
-                                if (urlObj.hostname.includes('google.') || urlObj.hostname.includes('gstatic.')) {
-                                    continue;
-                                }
-                            } catch(e) {
-                                continue;
-                            }
+                                if (urlObj.hostname.includes('google.') || urlObj.hostname.includes('gstatic.')) continue;
+                            } catch(e) { continue; }
 
-                            // Look for associated image inside or adjacent
                             let imgUrl = null;
                             const img = a.querySelector('img') || a.parentElement?.querySelector('img');
                             if (img) {
                                 imgUrl = img.src || img.getAttribute('data-src') || null;
                             }
 
-                            // Text title
                             let title = a.innerText || a.getAttribute('aria-label') || a.getAttribute('title') || '';
                             title = title.replace(/\\s+/g, ' ').trim();
 
-                            results.push({
-                                url: href,
-                                title: title,
-                                image_url: imgUrl,
-                                thumbnail_url: imgUrl
-                            });
+                            results.push({ url: href, title: title, image_url: imgUrl, thumbnail_url: imgUrl });
                         }
                         return results;
-                    }
-                """)
+                    }""")
 
-                rank = 1
-                for item in links_data:
-                    raw_url = item.get("url", "").strip()
-                    if not raw_url:
-                        continue
+                    raw_count = len(links_data)
+                    rank = 1
+                    for item in links_data:
+                        raw_url = item.get("url", "").strip()
+                        if not raw_url:
+                            continue
 
-                    domain = extract_domain(raw_url)
-                    if not domain or any(d in domain for d in GOOGLE_INTERNAL_DOMAINS):
-                        continue
+                        domain = extract_domain(raw_url)
+                        if not domain or any(d in domain for d in GOOGLE_INTERNAL_DOMAINS):
+                            continue
 
-                    norm_url = normalize_url(raw_url)
-                    if norm_url in seen_urls:
-                        continue
-                    seen_urls.add(norm_url)
+                        norm_url = normalize_url(raw_url)
+                        if norm_url in seen_urls:
+                            continue
+                        seen_urls.add(norm_url)
 
-                    title = item.get("title") or f"Visual Match on {domain}"
-                    # Truncate overly long text
-                    if len(title) > 120:
-                        title = title[:117] + "..."
+                        title = item.get("title") or f"Visual Match on {domain}"
+                        if len(title) > 120:
+                            title = title[:117] + "..."
 
-                    cand = SearchCandidate(
-                        url=raw_url,
-                        title=title,
-                        source_domain=domain,
-                        search_rank=rank,
-                        thumbnail_url=item.get("thumbnail_url"),
-                        image_url=item.get("image_url"),
+                        candidates.append(
+                            SearchCandidate(
+                                url=raw_url,
+                                title=title,
+                                source_domain=domain,
+                                search_rank=rank,
+                                thumbnail_url=item.get("thumbnail_url"),
+                                image_url=item.get("image_url"),
+                            )
+                        )
+                        rank += 1
+                        if len(candidates) >= MAX_SEARCH_CANDIDATES:
+                            break
+
+                except Exception as ex:
+                    logger.error(f"Google Lens execution error: {ex}")
+                    return SearchResponse(
+                        provider="google",
+                        status=SearchStatus.NETWORK_ERROR,
+                        elapsed_seconds=round(time.time() - t0, 2),
+                        error=str(ex),
                     )
-                    candidates.append(cand)
-                    rank += 1
+                finally:
+                    context.close()
+                    browser.close()
 
-                    if len(candidates) >= MAX_SEARCH_CANDIDATES:
-                        break
+        except Exception as e:
+            return SearchResponse(
+                provider="google",
+                status=SearchStatus.BROWSER_ERROR,
+                elapsed_seconds=round(time.time() - t0, 2),
+                error=str(e),
+            )
 
-                logger.info(f"Google Lens discovered {len(candidates)} candidates.")
+        elapsed = round(time.time() - t0, 2)
+        if candidates:
+            status = SearchStatus.SUCCESS
+            error = None
+        elif raw_count > 0:
+            status = SearchStatus.PARSER_FAILURE
+            error = f"Google Lens returned {raw_count} raw links, but none met domain criteria."
+        else:
+            status = SearchStatus.NO_RESULTS
+            error = "Google Lens search completed, but no usable candidates were discovered."
 
-            except Exception as exc:
-                logger.error(f"Google Lens execution encountered error: {exc}")
-            finally:
-                context.close()
-                browser.close()
-
-        return candidates
+        return SearchResponse(
+            provider="google",
+            status=status,
+            elapsed_seconds=elapsed,
+            raw_results_count=raw_count,
+            parsed_candidates_count=len(candidates),
+            candidates=candidates,
+            error=error,
+            diagnostics=diagnostics,
+        )
 
     def _dismiss_consent_popups(self, page) -> None:
         """Dismisses typical cookie and GDPR consent banners."""

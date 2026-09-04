@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: facechain
+    runtime: python
+    buildCommand: "./render-build.sh"
+    startCommand: "streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true"
+    envVars:
+      - key: SEARCH_HEADLESS
+        value: "true"
+      - key: SEARCH_PROVIDER
+        value: "auto"
+      - key: FACE_MATCH_THRESHOLD
+        value: "0.45"
+      - key: PYTHON_VERSION
+        value: "3.10.12"

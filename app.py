@@ -12,11 +12,21 @@ import numpy as np
 from PIL import Image
 import streamlit as st
 
+import os
+import platform
+import uuid
+
 import config
 from face.detector import FaceDetector
 from face.embedding import extract_embedding_vector
 from face.similarity import format_similarity
-from search import get_search_provider
+from search import (
+    get_search_provider,
+    normalize_provider,
+    SearchResponse,
+    SearchStatus,
+    PROVIDERS,
+)
 from pipeline.models import CandidateResult, CandidateStatus
 from pipeline.executor import run_candidate_evaluation, get_matches
 from extraction.metadata import build_matched_record
@@ -37,36 +47,54 @@ st.caption("HH Goa 2026 — Task 3: Local Face Verification & Tamper-Evident Pro
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 st.sidebar.header("⚙️ Pipeline Configuration")
 
-provider_name = st.sidebar.selectbox(
+raw_provider = st.sidebar.selectbox(
     "Search Provider",
     ["auto", "yandex", "bing", "google"],
     index=0,
 )
+provider_name = normalize_provider(raw_provider)
+
+# Invalidate stale pipeline results when user switches provider
+if st.session_state.get("_last_selected_provider") != provider_name:
+    for key in ["pipeline_results", "tamper_results"]:
+        st.session_state.pop(key, None)
+    st.session_state["_last_selected_provider"] = provider_name
+
 threshold = st.sidebar.slider(
     "Face Similarity Threshold",
     min_value=0.20, max_value=0.80,
     value=config.FACE_MATCH_THRESHOLD, step=0.05,
     help="ArcFace cosine similarity required to classify a candidate as a MATCH.",
 )
+
+# On Render or server environments, default to headless
+is_render_env = bool(os.getenv("RENDER") or os.getenv("SERVER_SOFTWARE") or os.name != "nt")
+default_headless = True
 headless = st.sidebar.checkbox(
-    "Headless Browser Search", value=True,
-    help="Uncheck to watch the browser search visually."
+    "Headless Browser Search",
+    value=default_headless,
+    help="Keep checked on server deployments.",
 )
-rpc_url = st.sidebar.text_input("Hardhat RPC URL", value=config.BLOCKCHAIN_RPC_URL)
 config.SEARCH_HEADLESS = headless
+
+default_rpc = os.getenv("BLOCKCHAIN_RPC_URL", config.BLOCKCHAIN_RPC_URL)
+rpc_url = st.sidebar.text_input("Blockchain RPC URL", value=default_rpc)
 
 # Blockchain node status badge in sidebar
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔗 Blockchain Status")
 _b_client = BlockchainClient(rpc_url=rpc_url)
 if _b_client.is_connected():
-    st.sidebar.success(f"✓ Node Connected")
+    st.sidebar.success("✓ Node Connected")
     if _b_client.contract_address:
         st.sidebar.caption(f"`{_b_client.contract_address}`")
     else:
         st.sidebar.warning("Contract not deployed — run deploy.js")
 else:
-    st.sidebar.error("❌ Node Offline  \n`cd hardhat && npx hardhat node`")
+    if is_render_env:
+        st.sidebar.warning("⚠️ Blockchain Node Offline  \nProvide external RPC (e.g. Sepolia) to anchor on cloud.")
+    else:
+        st.sidebar.error("❌ Node Offline  \n`cd hardhat && npx hardhat node`")
 
 st.info(
     "**Privacy Notice:** This pipeline performs local face detection and generates a 32-byte "
@@ -191,26 +219,45 @@ st.divider()
 if st.button("🚀 Run Visual Search & Verification Pipeline", type="primary"):
     # Clear stale tamper results from a previous run
     st.session_state.pop("tamper_results", None)
+    search_run_id = uuid.uuid4().hex[:8]
 
     # LIVE SEARCH
     with st.spinner("🌐 Executing live visual search…"):
         t0 = time.time()
         provider = get_search_provider(provider_name)
         try:
-            search_candidates = provider.search(str(selected_path))
+            search_response: SearchResponse = provider.search_detailed(str(selected_path))
         except Exception as e:
-            st.error(f"Visual search failed: {e}")
+            st.error(f"Visual search execution error: {e}")
             st.stop()
-        elapsed_search = round(time.time() - t0, 2)
+        search_candidates = search_response.candidates
+        elapsed_search = search_response.elapsed_seconds
 
     if not search_candidates:
-        st.error(
-            f"No candidates discovered by '{provider_name}'. "
-            "Try switching to 'yandex' in the sidebar."
-        )
+        if search_response.status == SearchStatus.PROVIDER_BLOCKED:
+            st.error(
+                f"🛑 **{provider_name.capitalize()} Search Blocked**: The search engine returned a bot verification or CAPTCHA challenge in this cloud environment."
+            )
+            st.info("💡 Try switching to **'bing'** or **'google'** in the sidebar.")
+        elif search_response.status == SearchStatus.BROWSER_ERROR:
+            st.error(f"❌ **Browser Automation Error**: {search_response.error}")
+            st.info("Ensure Playwright Chromium is installed: `playwright install chromium`.")
+        elif search_response.status == SearchStatus.PARSER_FAILURE:
+            st.error(f"⚠️ **Parser Notice**: {search_response.error or 'Results page loaded, but candidates could not be extracted.'}")
+            st.info("💡 Try switching to another provider in the sidebar.")
+        elif search_response.status == SearchStatus.NETWORK_ERROR:
+            st.error(f"🌐 **Network Error**: {search_response.error}")
+        elif provider_name == "auto":
+            st.error(search_response.error or "No candidates discovered across attempted providers.")
+        else:
+            st.warning(f"ℹ️ **{provider_name.capitalize()} search completed**, but no usable candidates were discovered.")
+            st.info("💡 You can try a different search provider in the sidebar or upload a different reference photo.")
         st.stop()
 
-    provider_used = getattr(provider, "last_provider_used", provider_name)
+    if provider_name == "auto":
+        provider_used = search_response.diagnostics.get("winning_provider", getattr(provider, "last_provider_used", "auto"))
+    else:
+        provider_used = provider_name
 
     # CANDIDATE EVALUATION (with progress bar)
     progress_bar = st.progress(0, text="Evaluating candidates…")
@@ -236,14 +283,17 @@ if st.button("🚀 Run Visual Search & Verification Pipeline", type="primary"):
     progress_bar.empty()
 
     diagnostics = {
+        "selected_provider": provider_name,
         "provider_used": provider_used,
         "search_elapsed_s": elapsed_search,
         "eval_elapsed_s": elapsed_eval,
-        "raw_count": len(search_candidates),
+        "raw_count": search_response.raw_results_count or len(search_candidates),
         "downloadable": sum(1 for c in all_candidates if c.download_success),
         "with_faces": sum(1 for c in all_candidates if c.faces_count > 0),
         "passing_threshold": len(matches),
         "threshold": threshold,
+        "search_run_id": search_run_id,
+        "search_status": search_response.status.value,
     }
 
     # Serialize CandidateResult objects to plain dicts for session state
@@ -270,7 +320,8 @@ threshold_used = _diag["threshold"]
 # ── Section 3: Search Results ─────────────────────────────────────────────────
 st.subheader(f"3. Live Search Results — {_diag['raw_count']} Discovered")
 st.markdown(
-    f"**Engine:** `{_diag['provider_used'].upper()}` | "
+    f"**Selected Provider:** `{_diag.get('selected_provider', provider_name).upper()}` | "
+    f"**Engine Used:** `{_diag['provider_used'].upper()}` | "
     f"**Search time:** `{_diag['search_elapsed_s']}s` | "
     f"**Evaluation time:** `{_diag['eval_elapsed_s']}s`"
 )
@@ -278,13 +329,27 @@ st.markdown(
 with st.expander("🔍 Pipeline Diagnostics", expanded=False):
     d_col1, d_col2 = st.columns(2)
     with d_col1:
-        st.write("Search provider:", _diag["provider_used"])
-        st.write("Raw candidates found:", _diag["raw_count"])
-        st.write("Downloadable images:", _diag["downloadable"])
+        st.write("**Selected provider:**", _diag.get("selected_provider", provider_name))
+        st.write("**Engine actually used:**", _diag["provider_used"])
+        st.write("**Raw candidates found:**", _diag["raw_count"])
+        st.write("**Downloadable images:**", _diag["downloadable"])
     with d_col2:
-        st.write("Human faces found:", _diag["with_faces"])
-        st.write(f"Passing threshold (≥{threshold_used:.2f}):", _diag["passing_threshold"])
-        st.write("Reference image hash:", st.session_state.get("_ref_img_hash", "N/A"))
+        st.write("**Human faces found:**", _diag["with_faces"])
+        st.write(f"**Passing threshold (≥{threshold_used:.2f}):**", _diag["passing_threshold"])
+        st.write("**Search Run ID:**", _diag.get("search_run_id", "N/A"))
+        st.write("**Execution Status:**", _diag.get("search_status", "SUCCESS"))
+
+with st.expander("🖥️ Deployment & Environment Diagnostics", expanded=False):
+    env_col1, env_col2 = st.columns(2)
+    with env_col1:
+        st.write("**Environment:**", "Render Cloud" if is_render_env else f"Local ({platform.system()})")
+        st.write("**Python Version:**", platform.python_version())
+        st.write("**Headless Search:**", "Enabled" if config.SEARCH_HEADLESS else "Disabled")
+    with env_col2:
+        st.write("**Selected Provider:**", provider_name)
+        st.write("**Provider Implementation:**", PROVIDERS.get(provider_name, AutoVisualProvider).__name__)
+        st.write("**Blockchain RPC:**", rpc_url)
+        st.write("**Blockchain Status:**", "Connected" if _b_client.is_connected() else "Offline")
 
 # ── Section 4: Candidate Analysis ────────────────────────────────────────────
 st.subheader("4. Candidate Analysis")

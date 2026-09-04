@@ -1,19 +1,18 @@
-"""Bing Visual Search provider — uses kblob API directly (no CAPTCHA).
+"""Bing Visual Search provider — uses kblob API directly with Playwright fallback."""
 
-Bing's internal kblob endpoint accepts a multipart upload and returns
-a JSON payload containing the visual search URL.  We then fetch that
-URL with a plain requests call and parse the image result cards.
-"""
-
+import io
 import json
 import logging
-import requests
-import io
+import os
+import re
+import time
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List, Optional
 from PIL import Image
+import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+import config
 from config import (
     SEARCH_HEADLESS,
     SEARCH_TIMEOUT_MS,
@@ -22,6 +21,7 @@ from config import (
 )
 from extraction.url_utils import extract_domain, normalize_url
 from .base import SearchCandidate, SearchProvider
+from .models import SearchResponse, SearchStatus
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,6 @@ BING_INTERNAL_DOMAINS = {
     "bingplaces.com",
 }
 
-# Max long-side pixels for upload (Bing rejects very large images)
 MAX_UPLOAD_PX = 1200
 
 BING_HEADERS = {
@@ -45,35 +44,34 @@ BING_HEADERS = {
     "Origin": "https://www.bing.com",
 }
 
+CHROMIUM_SERVER_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-blink-features=AutomationControlled",
+]
+
 
 class BingVisualProvider(SearchProvider):
-    """Executes live visual reverse-image search via Bing kblob API."""
+    """Executes live visual reverse-image search via Bing kblob API or Playwright."""
 
     @property
     def name(self) -> str:
-        return "bing_visual"
+        return "bing"
 
     def _prepare_image(self, path_obj: Path) -> bytes:
         """Resize image to max 1200px and convert to JPEG bytes."""
         im = Image.open(path_obj).convert("RGB")
         if max(im.size) > MAX_UPLOAD_PX:
             im.thumbnail((MAX_UPLOAD_PX, MAX_UPLOAD_PX), Image.LANCZOS)
-            logger.info(f"Resized image to {im.size} for Bing upload")
         buf = io.BytesIO()
         im.save(buf, format="JPEG", quality=90)
         return buf.getvalue()
 
-    def _upload_to_kblob(self, img_bytes: bytes) -> str | None:
+    def _upload_to_kblob(self, img_bytes: bytes) -> Optional[str]:
         """Upload image to Bing kblob and return the visual search URL."""
         try:
-            files = {"imgurl": ("image.jpg", img_bytes, "image/jpeg")}
-            params = {
-                "sbifsz": str(len(img_bytes)),
-                "imgfmt": "jpg",
-                "IG": "ABD913B4A4CA4F26B1B7651E96FA44E8",
-                "CID": "00000000000000000000000000000000",
-                "adrequired": "false",
-            }
             r = requests.post(
                 "https://www.bing.com/images/search",
                 params={
@@ -89,122 +87,144 @@ class BingVisualProvider(SearchProvider):
                 timeout=30,
                 allow_redirects=True,
             )
-            logger.info(f"Bing upload POST status: {r.status_code}, URL: {r.url[:80]}")
-
             if "bingvisualsearchapi" in r.url or "visuals" in r.url or r.status_code == 200:
                 return r.url
             return None
         except Exception as e:
-            logger.error(f"kblob upload error: {e}")
+            logger.warning(f"Bing kblob upload error: {e}")
             return None
 
-    def search(self, image_path: str) -> List[SearchCandidate]:
+    def search_detailed(self, image_path: str) -> SearchResponse:
+        t0 = time.time()
+        logger.info("SELECTED PROVIDER: bing")
+        logger.info("NORMALIZED PROVIDER: bing")
+        logger.info("PROVIDER IMPLEMENTATION: BingVisualProvider")
+
         path_obj = Path(image_path).resolve()
         if not path_obj.is_file():
-            raise FileNotFoundError(f"Input image does not exist: {path_obj}")
+            err_msg = f"Input image does not exist: {path_obj}"
+            return SearchResponse(
+                provider="bing",
+                status=SearchStatus.UNAVAILABLE,
+                elapsed_seconds=round(time.time() - t0, 2),
+                error=err_msg,
+            )
 
-        candidates: List[SearchCandidate] = []
-        seen_image_urls: set = set()
-
-        logger.info("Starting Bing Visual Search via kblob API...")
-
-        # Prepare (resize) image
         img_bytes = self._prepare_image(path_obj)
+        diagnostics: Dict[str, Any] = {"method": "kblob"}
 
-        # Try direct HTTP API upload first
+        # 1. Try direct HTTP API upload first
         results_url = self._upload_to_kblob(img_bytes)
-
         if results_url and "bing.com" in results_url:
-            # Fetch the results page via requests
             try:
                 r = requests.get(results_url, headers=BING_HEADERS, timeout=20)
                 card_data = self._parse_html_cards(r.text)
-                logger.info(f"Bing API returned {len(card_data)} cards from HTML")
                 if card_data:
-                    return self._build_candidates(card_data)
+                    candidates = self._build_candidates(card_data)
+                    elapsed = round(time.time() - t0, 2)
+                    return SearchResponse(
+                        provider="bing",
+                        status=SearchStatus.SUCCESS if candidates else SearchStatus.NO_RESULTS,
+                        elapsed_seconds=elapsed,
+                        raw_results_count=len(card_data),
+                        parsed_candidates_count=len(candidates),
+                        candidates=candidates,
+                        diagnostics={"method": "http_api"},
+                    )
             except Exception as e:
                 logger.warning(f"Direct HTML parse failed: {e}, falling back to Playwright")
 
-        # Fallback: Playwright browser upload
-        logger.info("Falling back to Playwright browser for Bing Visual Search...")
-        return self._playwright_search(path_obj, img_bytes)
+        # 2. Fallback: Playwright browser automation
+        diagnostics["method"] = "playwright"
+        return self._playwright_search_detailed(path_obj, img_bytes, t0, diagnostics)
 
-    def _playwright_search(self, path_obj: Path, img_bytes: bytes) -> List[SearchCandidate]:
-        """Use Playwright to upload image and extract results."""
-        # Save resized version for Playwright
-        resized_path = path_obj.parent.parent / "cache" / "_bing_upload_tmp.jpg"
+    def _playwright_search_detailed(
+        self, path_obj: Path, img_bytes: bytes, t0: float, diagnostics: Dict[str, Any]
+    ) -> SearchResponse:
+        resized_path = config.CACHE_DIR / "_bing_upload_tmp.jpg"
         resized_path.parent.mkdir(parents=True, exist_ok=True)
         resized_path.write_bytes(img_bytes)
 
+        is_render = bool(os.getenv("RENDER") or os.getenv("SERVER_SOFTWARE"))
+        use_headless = True if (is_render or os.name != "nt") else SEARCH_HEADLESS
+
         candidates: List[SearchCandidate] = []
-        seen_image_urls: set = set()
+        raw_count = 0
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=SEARCH_HEADLESS,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-gpu",
-                    "--no-sandbox",
-                ],
-            )
-            context = browser.new_context(
-                user_agent=USER_AGENT,
-                viewport={"width": 1400, "height": 1000},
-            )
-            page = context.new_page()
+        try:
+            with sync_playwright() as p:
+                try:
+                    browser = p.chromium.launch(
+                        headless=use_headless,
+                        args=CHROMIUM_SERVER_ARGS,
+                    )
+                except Exception as b_err:
+                    err = f"Failed to launch Chromium for Bing: {b_err}"
+                    return SearchResponse(
+                        provider="bing",
+                        status=SearchStatus.BROWSER_ERROR,
+                        elapsed_seconds=round(time.time() - t0, 2),
+                        error=err,
+                        diagnostics=diagnostics,
+                    )
 
-            try:
-                logger.info("Navigating to Bing Images...")
-                page.goto(
-                    "https://www.bing.com/images",
-                    timeout=SEARCH_TIMEOUT_MS,
-                    wait_until="domcontentloaded",
+                context = browser.new_context(
+                    user_agent=USER_AGENT,
+                    viewport={"width": 1400, "height": 1000},
                 )
-                page.wait_for_timeout(2000)
-                self._dismiss_popups(page)
+                page = context.new_page()
 
-                # Click camera icon
-                cam_selectors = [
-                    "#sb_imgsearch",
-                    "#sbi_b",
-                    '[aria-label*="search using an image"]',
-                    '[aria-label*="Visual search"]',
-                    'label[for="sb_file_upload"]',
-                ]
-                for sel in cam_selectors:
-                    try:
-                        btn = page.query_selector(sel)
-                        if btn and btn.is_visible():
-                            btn.click()
-                            page.wait_for_timeout(1500)
+                try:
+                    logger.info("Navigating to Bing Images...")
+                    page.goto(
+                        "https://www.bing.com/images",
+                        timeout=SEARCH_TIMEOUT_MS,
+                        wait_until="domcontentloaded",
+                    )
+                    page.wait_for_timeout(2000)
+                    self._dismiss_popups(page)
+
+                    cam_selectors = [
+                        "#sb_imgsearch",
+                        "#sbi_b",
+                        '[aria-label*="search using an image"]',
+                        '[aria-label*="Visual search"]',
+                        'label[for="sb_file_upload"]',
+                    ]
+                    for sel in cam_selectors:
+                        try:
+                            btn = page.query_selector(sel)
+                            if btn and btn.is_visible():
+                                btn.click()
+                                page.wait_for_timeout(1500)
+                                break
+                        except Exception:
+                            pass
+
+                    file_input = page.query_selector('input[type="file"]')
+                    if not file_input:
+                        return SearchResponse(
+                            provider="bing",
+                            status=SearchStatus.PARSER_FAILURE,
+                            elapsed_seconds=round(time.time() - t0, 2),
+                            error="Could not locate file input on Bing Images.",
+                            diagnostics=diagnostics,
+                        )
+
+                    logger.info(f"Uploading resized image to Bing: {resized_path.name}")
+                    file_input.set_input_files(str(resized_path))
+
+                    page.wait_for_timeout(5000)
+                    for result_sel in ["a.iusc", ".iuscp", ".infnmpt", "a[m]"]:
+                        try:
+                            page.wait_for_selector(result_sel, timeout=8000)
                             break
-                    except Exception:
-                        pass
+                        except PlaywrightTimeoutError:
+                            pass
 
-                # Use file chooser to upload resized image
-                file_input = page.query_selector('input[type="file"]')
-                if not file_input:
-                    logger.warning("Could not locate file input on Bing Images.")
-                    return []
+                    page.wait_for_timeout(2000)
 
-                logger.info(f"Uploading resized image to Bing: {resized_path.name}")
-                file_input.set_input_files(str(resized_path))
-
-                logger.info("Waiting for Bing visual search results...")
-                page.wait_for_timeout(5000)
-
-                for result_sel in ["a.iusc", ".iuscp", ".infnmpt", "a[m]"]:
-                    try:
-                        page.wait_for_selector(result_sel, timeout=8000)
-                        break
-                    except PlaywrightTimeoutError:
-                        pass
-
-                page.wait_for_timeout(2000)
-
-                card_data = page.evaluate("""
-                    () => {
+                    card_data = page.evaluate("""() => {
                         const results = [];
                         for (const a of document.querySelectorAll('a[m]')) {
                             try {
@@ -228,25 +248,56 @@ class BingVisualProvider(SearchProvider):
                             }
                         }
                         return results;
-                    }
-                """)
+                    }""")
 
-                logger.info(f"Bing Playwright extraction returned {len(card_data)} raw items.")
-                candidates = self._build_candidates(card_data)
+                    raw_count = len(card_data)
+                    candidates = self._build_candidates(card_data)
 
-            except Exception as exc:
-                logger.error(f"Bing Visual Search (Playwright) error: {exc}", exc_info=True)
-            finally:
-                context.close()
-                browser.close()
+                except Exception as exc:
+                    return SearchResponse(
+                        provider="bing",
+                        status=SearchStatus.NETWORK_ERROR,
+                        elapsed_seconds=round(time.time() - t0, 2),
+                        error=str(exc),
+                        diagnostics=diagnostics,
+                    )
+                finally:
+                    context.close()
+                    browser.close()
 
-        return candidates
+        except Exception as e:
+            return SearchResponse(
+                provider="bing",
+                status=SearchStatus.BROWSER_ERROR,
+                elapsed_seconds=round(time.time() - t0, 2),
+                error=str(e),
+                diagnostics=diagnostics,
+            )
+
+        elapsed = round(time.time() - t0, 2)
+        if candidates:
+            status = SearchStatus.SUCCESS
+            error = None
+        elif raw_count > 0:
+            status = SearchStatus.PARSER_FAILURE
+            error = f"Bing returned {raw_count} raw links, but none met domain criteria."
+        else:
+            status = SearchStatus.NO_RESULTS
+            error = "Bing search completed, but no usable candidates were discovered."
+
+        return SearchResponse(
+            provider="bing",
+            status=status,
+            elapsed_seconds=elapsed,
+            raw_results_count=raw_count,
+            parsed_candidates_count=len(candidates),
+            candidates=candidates,
+            error=error,
+            diagnostics=diagnostics,
+        )
 
     def _parse_html_cards(self, html: str) -> list:
-        """Parse Bing image cards from raw HTML."""
-        import re
         cards = []
-        # Find all JSON m attributes
         for m in re.finditer(r'"murl"\s*:\s*"([^"]+)".*?"purl"\s*:\s*"([^"]*)"', html):
             murl = m.group(1).replace("\\u0026", "&")
             purl = m.group(2).replace("\\u0026", "&")
@@ -255,9 +306,8 @@ class BingVisualProvider(SearchProvider):
         return cards
 
     def _build_candidates(self, card_data: list) -> List[SearchCandidate]:
-        """Convert raw card dicts to SearchCandidate list."""
         candidates = []
-        seen: set = set()
+        seen = set()
         rank = 1
         for item in card_data:
             image_url = (item.get("image_url") or "").strip()
@@ -274,10 +324,7 @@ class BingVisualProvider(SearchProvider):
             seen.add(norm)
 
             domain = extract_domain(page_url) if page_url else extract_domain(image_url)
-            if not domain:
-                continue
-
-            if any(d in domain for d in BING_INTERNAL_DOMAINS):
+            if not domain or any(d in domain for d in BING_INTERNAL_DOMAINS):
                 continue
 
             if not title:
@@ -300,11 +347,9 @@ class BingVisualProvider(SearchProvider):
             if len(candidates) >= MAX_SEARCH_CANDIDATES:
                 break
 
-        logger.info(f"Bing Visual Search discovered {len(candidates)} usable candidates.")
         return candidates
 
     def _dismiss_popups(self, page) -> None:
-        """Dismisses cookie / GDPR consent banners."""
         for sel in [
             "#bnp_btn_accept",
             'button:has-text("Accept all")',

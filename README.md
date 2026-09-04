@@ -133,18 +133,34 @@ Open **http://localhost:8501** in your browser.
 
 ---
 
-### Option 3: Cloud Deployment (Render / Railway / Hugging Face Spaces / VPS)
-To deploy online for public access:
-1. **Render / Railway / GCP Cloud Run:** 
-   - Connect your GitHub repo: `Devsrinivas69/FaceChain-Visual-Discovery-Blockchain-Verification-Engine`.
-   - Select **Docker** deployment.
-   - The included `Dockerfile` and `entrypoint.sh` handle system libraries, Chromium, contract deployment, and start the app on `$PORT`.
-2. **Cloud VPS (DigitalOcean / AWS / GCP VM):**
+### Option 3: Cloud Deployment on Render (Render Blueprint / Docker)
+Deploy to the web so anyone with a browser can access the live application:
+1. **Render (Docker Web Service — Recommended):**
+   - Connect your GitHub repo: `Devsrinivas69/FaceChain-Visual-Discovery-Blockchain-Verification-Engine`
+   - Environment: **Docker**
+   - The included [`Dockerfile`](Dockerfile) and [`entrypoint.sh`](entrypoint.sh) automatically provision Chromium dependencies, boot the embedded local Ethereum node, deploy the smart contract, and bind Streamlit to Render's assigned `$PORT`.
+2. **Render (Native Python Web Service):**
+   - Connect your GitHub repo and select Blueprint or Python environment.
+   - Build Command: `./render-build.sh`
+   - Start Command: `streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true`
+   - The [`render.yaml`](render.yaml) blueprint file is preconfigured for 1-click deployment.
+3. **Cloud VPS (DigitalOcean / AWS / GCP VM):**
    ```bash
    git clone https://github.com/Devsrinivas69/FaceChain-Visual-Discovery-Blockchain-Verification-Engine.git
    cd FaceChain-Visual-Discovery-Blockchain-Verification-Engine
    docker compose up -d
    ```
+
+---
+
+## 🌐 Search Provider Capabilities & Cloud Environments
+
+| Provider | Mechanism | Local Behavior | Cloud / Server Behavior (Render/VPS) |
+|---|---|---|---|
+| **Auto** (Default) | Intelligent Cascade | Google Lens → Bing → Yandex | Automatically falls back to the best available provider |
+| **Bing** | kblob API + Playwright | Fast reverse search, no CAPTCHA | Highly reliable across cloud datacenter IPs |
+| **Google** | Google Lens via Playwright | High accuracy face matches | Reliable in headless Linux environments |
+| **Yandex** | Yandex Images via Playwright | Excellent face reverse search | Note: Datacenter IPs (Render/AWS) may trigger Yandex SmartCaptcha challenges. When detected, status is reported as `PROVIDER_BLOCKED` and the UI directs you to Bing or Auto. |
 
 ---
 
