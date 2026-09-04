@@ -115,7 +115,42 @@ task 3/
 
 ---
 
-## ⚡ Quick Start
+## 🚀 How to Run & Deploy (Easiest Ways)
+
+### Option 1: 1-Click Automated Launch (Recommended for Local / Demo)
+No need to manage multiple terminals manually. The automated startup scripts boot the local Hardhat node, deploy the smart contract, and launch Streamlit with one click:
+- **Windows:** Double-click [`start.bat`](start.bat) or run `.\start.bat`
+- **macOS / Linux:** Run `chmod +x start.sh && ./start.sh`
+
+---
+
+### Option 2: 1-Command Docker Deployment (Local or Any Cloud Server)
+Deploy the full stack with Python, Playwright Chromium, InsightFace, and the Hardhat Ethereum node packaged into a single container:
+```bash
+docker compose up --build
+```
+Open **http://localhost:8501** in your browser.
+
+---
+
+### Option 3: Cloud Deployment (Render / Railway / Hugging Face Spaces / VPS)
+To deploy online for public access:
+1. **Render / Railway / GCP Cloud Run:** 
+   - Connect your GitHub repo: `Devsrinivas69/FaceChain-Visual-Discovery-Blockchain-Verification-Engine`.
+   - Select **Docker** deployment.
+   - The included `Dockerfile` and `entrypoint.sh` handle system libraries, Chromium, contract deployment, and start the app on `$PORT`.
+2. **Cloud VPS (DigitalOcean / AWS / GCP VM):**
+   ```bash
+   git clone https://github.com/Devsrinivas69/FaceChain-Visual-Discovery-Blockchain-Verification-Engine.git
+   cd FaceChain-Visual-Discovery-Blockchain-Verification-Engine
+   docker compose up -d
+   ```
+
+---
+
+## ⚡ Manual Step-by-Step Setup
+
+If you prefer running components manually across separate terminals:
 
 ### Prerequisites
 
