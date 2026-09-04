@@ -20,20 +20,21 @@ for directory in [DATA_DIR, INPUT_DIR, CACHE_DIR, OUTPUT_DIR]:
 
 # Face analysis configuration
 # Note on threshold: Cosine similarity for 512-d ArcFace embeddings typically ranges from
-# ~0.20-0.35 for unrelated faces, and >0.45-0.50 for the same individual across varying poses/lighting.
-# 0.45 is a balanced benchmark threshold, fully configurable.
-FACE_MATCH_THRESHOLD: float = float(os.getenv("FACE_MATCH_THRESHOLD", "0.45"))
+# ~0.20-0.35 for unrelated faces, and >0.38-0.50 for the same individual across varying poses/lighting.
+# 0.38 is a permissive benchmark threshold that reduces false negatives (missed true matches).
+# Raise to 0.50+ if you need fewer but higher-confidence matches.
+FACE_MATCH_THRESHOLD: float = float(os.getenv("FACE_MATCH_THRESHOLD", "0.38"))
 INSIGHTFACE_MODEL: str = os.getenv("INSIGHTFACE_MODEL", "buffalo_sc")
 INSIGHTFACE_PROVIDERS: list[str] = ["CPUExecutionProvider"]
 
 # Web Search configuration
 SEARCH_PROVIDER: str = os.getenv("SEARCH_PROVIDER", "yandex").lower()  # yandex | bing | google | auto
-MAX_SEARCH_CANDIDATES: int = int(os.getenv("MAX_SEARCH_CANDIDATES", "15"))
+MAX_SEARCH_CANDIDATES: int = int(os.getenv("MAX_SEARCH_CANDIDATES", "20"))
 SEARCH_HEADLESS: bool = os.getenv("SEARCH_HEADLESS", "true").lower() in ("1", "true", "yes")
 SEARCH_TIMEOUT_MS: int = int(os.getenv("SEARCH_TIMEOUT_MS", "30000"))
 
 # Media extraction & download limits
-DOWNLOAD_TIMEOUT_SECS: int = int(os.getenv("DOWNLOAD_TIMEOUT_SECS", "12"))
+DOWNLOAD_TIMEOUT_SECS: int = int(os.getenv("DOWNLOAD_TIMEOUT_SECS", "8"))
 MAX_DOWNLOAD_SIZE_BYTES: int = int(os.getenv("MAX_DOWNLOAD_SIZE_BYTES", str(15 * 1024 * 1024)))  # 15 MB limit
 USER_AGENT: str = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

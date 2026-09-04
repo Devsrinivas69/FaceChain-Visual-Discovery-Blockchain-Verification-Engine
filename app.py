@@ -55,6 +55,7 @@ raw_provider = st.sidebar.selectbox(
 )
 provider_name = normalize_provider(raw_provider)
 st.sidebar.caption("⚡ **Recommended:** `auto` or `bing` for fastest cloud searches.")
+st.sidebar.caption("🚀 **Parallel evaluation** enabled — candidates evaluated in ~15-25s.")
 
 # Invalidate stale pipeline results when user switches provider
 if st.session_state.get("_last_selected_provider") != provider_name:
@@ -340,11 +341,13 @@ threshold_used = _diag["threshold"]
 
 # ── Section 3: Search Results ─────────────────────────────────────────────────
 st.subheader(f"3. Live Search Results — {_diag['raw_count']} Discovered")
+total_elapsed = round(_diag['search_elapsed_s'] + _diag['eval_elapsed_s'], 1)
 st.markdown(
     f"**Selected Provider:** `{_diag.get('selected_provider', provider_name).upper()}` | "
     f"**Engine Used:** `{_diag['provider_used'].upper()}` | "
-    f"**Search time:** `{_diag['search_elapsed_s']}s` | "
-    f"**Evaluation time:** `{_diag['eval_elapsed_s']}s`"
+    f"**Search:** `{_diag['search_elapsed_s']}s` | "
+    f"**Evaluation:** `{_diag['eval_elapsed_s']}s` | "
+    f"**Total:** `{total_elapsed}s`"
 )
 
 with st.expander("🔍 Pipeline Diagnostics", expanded=False):

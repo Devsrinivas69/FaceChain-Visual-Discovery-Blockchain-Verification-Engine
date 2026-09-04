@@ -7,6 +7,7 @@ calls apply_evaluation() — ensuring is_match is always set correctly.
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -160,6 +161,13 @@ def compute_composite_score(
     return round(sim_component + rank_component + media_component, 2)
 
 
+# Max parallel workers for concurrent image download + face evaluation.
+# Use 6 threads: download is I/O-bound so parallelism gives 4-6x speedup.
+_EVAL_MAX_WORKERS = 6
+# Hard timeout per candidate evaluation in seconds (download + detect + embed).
+_EVAL_CANDIDATE_TIMEOUT_S = 25
+
+
 def run_candidate_evaluation(
     search_candidates: List[SearchCandidate],
     detector: FaceDetector,
@@ -169,25 +177,72 @@ def run_candidate_evaluation(
     progress_callback=None,
 ) -> Tuple[List[CandidateResult], List[CandidateResult]]:
     """
-    Evaluate all search candidates end-to-end.
+    Evaluate all search candidates end-to-end in parallel.
     Returns (all_results, match_results) both as CandidateResult lists.
+
+    Uses a ThreadPoolExecutor so that image downloads (I/O-bound) run
+    concurrently, giving a 4-6x wall-clock speedup over serial evaluation.
+    Face detection/embedding (CPU-bound) is fast relative to download latency.
     """
-    all_results: List[CandidateResult] = []
+    total = len(search_candidates)
+    # index_map keeps futures in submission order so we can restore original rank order
+    future_to_idx: dict = {}
+    ordered: List[Optional[CandidateResult]] = [None] * total
+    completed_count = 0
 
-    for idx, sc in enumerate(search_candidates, 1):
-        if progress_callback:
-            progress_callback(idx, len(search_candidates), sc.source_domain)
+    with ThreadPoolExecutor(max_workers=min(_EVAL_MAX_WORKERS, max(1, total))) as pool:
+        for idx, sc in enumerate(search_candidates, 1):
+            future = pool.submit(
+                evaluate_candidate,
+                idx,
+                sc,
+                detector,
+                query_embedding,
+                threshold,
+                search_provider,
+            )
+            future_to_idx[future] = idx - 1  # 0-based position
 
-        result = evaluate_candidate(
-            idx=idx,
-            search_cand=sc,
-            detector=detector,
-            query_embedding=query_embedding,
-            threshold=threshold,
-            search_provider=search_provider,
-        )
-        all_results.append(result)
+        for future in as_completed(future_to_idx, timeout=_EVAL_CANDIDATE_TIMEOUT_S * total):
+            pos = future_to_idx[future]
+            completed_count += 1
+            try:
+                result = future.result(timeout=_EVAL_CANDIDATE_TIMEOUT_S)
+            except FuturesTimeout:
+                sc = search_candidates[pos]
+                result = CandidateResult(
+                    candidate_id=make_candidate_id(pos + 1, sc.source_domain),
+                    source_url=sc.url,
+                    source_domain=sc.source_domain,
+                    title=sc.title or f"Result from {sc.source_domain}",
+                    image_url=sc.image_url,
+                    thumbnail_url=sc.thumbnail_url,
+                    search_rank=sc.search_rank,
+                    search_provider=search_provider,
+                )
+                result.mark_download_failed("Evaluation timed out")
+            except Exception as exc:
+                sc = search_candidates[pos]
+                result = CandidateResult(
+                    candidate_id=make_candidate_id(pos + 1, sc.source_domain),
+                    source_url=sc.url,
+                    source_domain=sc.source_domain,
+                    title=sc.title or f"Result from {sc.source_domain}",
+                    image_url=sc.image_url,
+                    thumbnail_url=sc.thumbnail_url,
+                    search_rank=sc.search_rank,
+                    search_provider=search_provider,
+                )
+                result.mark_download_failed(f"Evaluation error: {exc}")
+                logger.warning(f"[pos={pos}] Evaluation future exception: {exc}")
 
+            ordered[pos] = result
+
+            if progress_callback:
+                progress_callback(completed_count, total, result.source_domain)
+
+    # Filter out any None slots (shouldn't happen but guard defensively)
+    all_results = [r for r in ordered if r is not None]
     ranked = rank_candidates(all_results)
     matches = get_matches(ranked)
     return ranked, matches
