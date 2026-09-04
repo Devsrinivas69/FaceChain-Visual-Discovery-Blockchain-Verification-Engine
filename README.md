@@ -4,6 +4,43 @@
 
 ---
 
+## 📸 Pipeline in Action
+
+### Step 4 — Candidate Analysis
+*15 web images discovered, 14 downloaded, 12 human faces found, 12 passing threshold*
+
+![Candidate Analysis](docs/screenshots/01_candidate_analysis.png)
+
+---
+
+### Step 5 — Best Face Match
+*ArcFace cosine similarity 96.3% — confirmed match from `ichef.bbci.co.uk`*
+
+![Best Face Match](docs/screenshots/02_best_face_match.png)
+
+---
+
+### Step 6 — Content Fingerprint
+*Canonical SHA-256 manifest — deterministic, reproducible fingerprint of matched content*
+
+![Content Fingerprint](docs/screenshots/03_content_fingerprint.png)
+
+---
+
+### Step 7 — Blockchain Provenance (Real On-Chain TX)
+*Transaction anchored on Hardhat local Ethereum — Block #13, Gas: 73,563, TX: SUCCESS*
+
+![Blockchain Provenance](docs/screenshots/04_blockchain_provenance.png)
+
+---
+
+### Step 8 — Blockchain Verification
+*`contract.verify(hash)` RPC call returns `exists = True` — independently confirmed*
+
+![Blockchain Verification](docs/screenshots/05_blockchain_verification.png)
+
+---
+
 ## 🧠 What This Does
 
 | Step | Description |
