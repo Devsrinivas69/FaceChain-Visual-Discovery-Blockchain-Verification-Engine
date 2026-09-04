@@ -186,12 +186,12 @@ def download_candidate_image(
         return h
 
     urls_to_try = []
-    if image_url and is_safe_url(image_url):
+    if image_url and (is_safe_url(image_url) or image_url.startswith("data:image/")):
         urls_to_try.append(("direct_image", image_url))
+    if fallback_thumbnail_url and (is_safe_url(fallback_thumbnail_url) or fallback_thumbnail_url.startswith("data:image/")):
+        urls_to_try.append(("thumbnail", fallback_thumbnail_url))
     if candidate_page_url and is_safe_url(candidate_page_url):
         urls_to_try.append(("page_url", candidate_page_url))
-    if fallback_thumbnail_url and is_safe_url(fallback_thumbnail_url):
-        urls_to_try.append(("thumbnail", fallback_thumbnail_url))
 
     if not urls_to_try:
         err = "No valid safe URLs provided for download."
@@ -206,7 +206,16 @@ def download_candidate_image(
             target_url = url
             raw_bytes = None
 
-            if kind == "page_url":
+            if url.startswith("data:image/"):
+                try:
+                    import base64
+                    _, b64_data = url.split(",", 1)
+                    raw_bytes = base64.b64decode(b64_data)
+                    target_url = "data:image"
+                except Exception as e:
+                    last_error = f"Invalid data URI: {e}"
+                    continue
+            elif kind == "page_url":
                 # Fetch page HTML and resolve og:image
                 resp = session.get(url, timeout=DOWNLOAD_TIMEOUT_SECS, stream=False, headers=_headers_for(url))
                 if resp.status_code != 200:

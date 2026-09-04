@@ -40,7 +40,7 @@ def verify_content(
     recomputed_hash = compute_provenance_hash(manifest)
     formatted_hash = to_bytes32_hex(recomputed_hash)
 
-    on_chain = blockchain_client.verify_provenance(recomputed_hash)
+    on_chain = blockchain_client.verify_provenance_safe(recomputed_hash)
     exists = on_chain.get("exists", False)
 
     if exists:
@@ -107,7 +107,7 @@ def run_tamper_demonstration(
     original_provenance_hash = to_bytes32_hex(compute_provenance_hash(original_manifest))
 
     # Query blockchain for tampered hash
-    verification = blockchain_client.verify_provenance(tampered_provenance_hash)
+    verification = blockchain_client.verify_provenance_safe(tampered_provenance_hash)
     exists = verification.get("exists", False)
 
     return {
