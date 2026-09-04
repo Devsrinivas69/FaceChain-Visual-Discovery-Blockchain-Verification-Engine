@@ -1,0 +1,21 @@
+# Core Computer Vision & Face Analysis
+insightface>=1.0.1
+onnxruntime>=1.20.0
+opencv-python>=4.11.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# Browser Automation & Genuine Search
+playwright>=1.40.0
+beautifulsoup4>=4.12.0
+requests>=2.31.0
+
+# Blockchain & Web3
+web3>=7.0.0
+
+# Environment & Utilities
+python-dotenv>=1.0.0
+
+# Testing & UI
+pytest>=8.0.0
+streamlit>=1.30.0

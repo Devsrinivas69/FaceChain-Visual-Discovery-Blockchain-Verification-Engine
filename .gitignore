@@ -1,0 +1,69 @@
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ─── Virtual Environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ─── Environment / Secrets ────────────────────────────────────────────────────
+.env
+.env.*
+*.secret
+
+# ─── Data Directories (downloaded images, cache, outputs) ─────────────────────
+data/cache/
+data/output/
+data/input/upload_*
+
+# ─── InsightFace Models (large binary files, downloaded on first run) ──────────
+# ~/.insightface is the default model cache — exclude any accidentally copied model files
+*.onnx
+*.onnx.prototxt
+
+# ─── Hardhat / Ethereum ───────────────────────────────────────────────────────
+hardhat/node_modules/
+hardhat/artifacts/
+hardhat/cache/
+hardhat/.openzeppelin/
+
+# ─── Playwright Browser Binaries ──────────────────────────────────────────────
+# Installed at OS level by: playwright install chromium
+# Do not commit
+.playwright/
+
+# ─── OS / Editor ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/settings.json
+*.iml
+
+# ─── pytest / Coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+*.coveragerc
+
+# ─── Jupyter / Notebooks ──────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ─── Streamlit ────────────────────────────────────────────────────────────────
+.streamlit/secrets.toml
+
+# ─── Scratch / Temp ───────────────────────────────────────────────────────────
+scratch/
+tampered_*.jpg
+tampered_*.png
