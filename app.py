@@ -241,17 +241,32 @@ if st.button("🚀 Run Visual Search & Verification Pipeline", type="primary"):
     st.session_state.pop("tamper_results", None)
     search_run_id = uuid.uuid4().hex[:8]
 
-    # LIVE SEARCH
-    with st.spinner("🌐 Executing live visual search…"):
+    # LIVE SEARCH — st.status gives real-time step-by-step visibility
+    with st.status(
+        f"🌐 Running {provider_name.upper()} visual search…",
+        expanded=True,
+    ) as status_box:
         t0 = time.time()
+        st.write(f"**Step 1 ·** Launching {provider_name.capitalize()} search engine…")
         provider = get_search_provider(provider_name)
         try:
             search_response: SearchResponse = provider.search_detailed(str(selected_path))
         except Exception as e:
+            status_box.update(label="❌ Search failed", state="error")
             st.error(f"Visual search execution error: {e}")
             st.stop()
         search_candidates = search_response.candidates
         elapsed_search = search_response.elapsed_seconds
+        n_found = len(search_candidates)
+        if n_found > 0:
+            status_box.update(
+                label=f"✅ {provider_name.capitalize()} search complete — {n_found} candidates found in {elapsed_search:.1f}s",
+                state="complete",
+                expanded=False,
+            )
+        else:
+            status_box.update(label=f"⚠️ {provider_name.capitalize()} search returned 0 candidates", state="error")
+
 
     if not search_candidates:
         if search_response.status == SearchStatus.PROVIDER_BLOCKED:
