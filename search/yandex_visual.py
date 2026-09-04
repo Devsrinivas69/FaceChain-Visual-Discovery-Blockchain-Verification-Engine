@@ -106,8 +106,10 @@ class YandexVisualProvider(SearchProvider):
                 try:
                     # 1. Navigate to Yandex Images
                     logger.info("Navigating to https://yandex.com/images")
-                    page.goto("https://yandex.com/images", timeout=35000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(1500)
+                    page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] and "search" not in page.url else route.continue_())
+
+                    page.goto("https://yandex.com/images", timeout=20000, wait_until="commit")
+                    page.wait_for_timeout(1000)
 
                     # 2. Check for bot verification / CAPTCHA
                     current_url = page.url.lower()
@@ -120,7 +122,7 @@ class YandexVisualProvider(SearchProvider):
                         or "checkbox-captcha" in page_content
                         or "robot" in page_content and "verification" in page_content
                     ):
-                        err_msg = "Yandex presented a bot verification/CAPTCHA challenge."
+                        err_msg = "Yandex presented a bot verification/CAPTCHA challenge in this cloud environment. Cloud datacenter IPs are often blocked by Yandex. Switch to 'bing' in the sidebar."
                         logger.warning(err_msg)
                         return SearchResponse(
                             provider="yandex",
@@ -134,14 +136,19 @@ class YandexVisualProvider(SearchProvider):
                     file_input = page.query_selector('input[type="file"]')
                     if not file_input:
                         # Try clicking the camera icon to reveal file input
-                        camera_btn = page.query_selector('button[aria-label*="image"], .input__cbir-button, .cbir-button')
-                        if camera_btn:
-                            camera_btn.click()
-                            page.wait_for_timeout(1000)
-                            file_input = page.query_selector('input[type="file"]')
+                        for cam_sel in ['button[aria-label*="image"]', '.input__cbir-button', '.cbir-button', 'button.button_theme_action']:
+                            try:
+                                camera_btn = page.query_selector(cam_sel)
+                                if camera_btn and camera_btn.is_visible():
+                                    camera_btn.click()
+                                    page.wait_for_timeout(800)
+                                    break
+                            except Exception:
+                                pass
+                        file_input = page.query_selector('input[type="file"]')
 
                     if not file_input:
-                        err_msg = "Could not locate image upload element on Yandex page."
+                        err_msg = "Could not locate image upload element on Yandex page. Cloud datacenter IPs are often blocked by Yandex. Switch to 'bing' in the sidebar."
                         logger.warning(err_msg)
                         return SearchResponse(
                             provider="yandex",
@@ -153,6 +160,10 @@ class YandexVisualProvider(SearchProvider):
 
                     # 4. Upload file
                     logger.info(f"Uploading file to Yandex: {path_obj.name}")
+                    try:
+                        page.unroute("**/*")
+                    except Exception:
+                        pass
                     file_input.set_input_files(str(path_obj))
 
                     # 5. Wait for results page

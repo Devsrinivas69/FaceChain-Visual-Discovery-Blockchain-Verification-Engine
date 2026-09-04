@@ -176,12 +176,15 @@ class BingVisualProvider(SearchProvider):
 
                 try:
                     logger.info("Navigating to Bing Images...")
+                    # Block unneeded landing page images/fonts during initial load for instant navigation
+                    page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] and "bing.com/images" in page.url and "search" not in page.url else route.continue_())
+
                     page.goto(
                         "https://www.bing.com/images",
-                        timeout=SEARCH_TIMEOUT_MS,
-                        wait_until="domcontentloaded",
+                        timeout=20000,
+                        wait_until="commit",
                     )
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(800)
                     self._dismiss_popups(page)
 
                     cam_selectors = [
@@ -196,7 +199,7 @@ class BingVisualProvider(SearchProvider):
                             btn = page.query_selector(sel)
                             if btn and btn.is_visible():
                                 btn.click()
-                                page.wait_for_timeout(1500)
+                                page.wait_for_timeout(800)
                                 break
                         except Exception:
                             pass
@@ -214,15 +217,19 @@ class BingVisualProvider(SearchProvider):
                     logger.info(f"Uploading resized image to Bing: {resized_path.name}")
                     file_input.set_input_files(str(resized_path))
 
-                    page.wait_for_timeout(5000)
+                    # Allow media on results page
+                    try:
+                        page.unroute("**/*")
+                    except Exception:
+                        pass
+
+                    page.wait_for_timeout(3500)
                     for result_sel in ["a.iusc", ".iuscp", ".infnmpt", "a[m]"]:
                         try:
-                            page.wait_for_selector(result_sel, timeout=8000)
+                            page.wait_for_selector(result_sel, timeout=6000)
                             break
                         except PlaywrightTimeoutError:
                             pass
-
-                    page.wait_for_timeout(2000)
 
                     card_data = page.evaluate("""() => {
                         const results = [];

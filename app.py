@@ -49,10 +49,11 @@ st.sidebar.header("⚙️ Pipeline Configuration")
 
 raw_provider = st.sidebar.selectbox(
     "Search Provider",
-    ["auto", "yandex", "bing", "google"],
+    ["auto", "bing", "yandex", "google"],
     index=0,
 )
 provider_name = normalize_provider(raw_provider)
+st.sidebar.caption("⚡ **Recommended:** `auto` or `bing` for fastest cloud searches.")
 
 # Invalidate stale pipeline results when user switches provider
 if st.session_state.get("_last_selected_provider") != provider_name:
@@ -236,22 +237,24 @@ if st.button("🚀 Run Visual Search & Verification Pipeline", type="primary"):
     if not search_candidates:
         if search_response.status == SearchStatus.PROVIDER_BLOCKED:
             st.error(
-                f"🛑 **{provider_name.capitalize()} Search Blocked**: The search engine returned a bot verification or CAPTCHA challenge in this cloud environment."
+                f"🛑 **{provider_name.capitalize()} Search Blocked**: The search engine presented a bot challenge (CAPTCHA) in this cloud environment. Cloud datacenter IPs are frequently restricted by {provider_name.capitalize()}."
             )
-            st.info("💡 Try switching to **'bing'** or **'google'** in the sidebar.")
+            st.info("💡 Switch to **'bing'** or **'auto'** in the sidebar (Bing visual search is unrestricted and fast).")
         elif search_response.status == SearchStatus.BROWSER_ERROR:
             st.error(f"❌ **Browser Automation Error**: {search_response.error}")
-            st.info("Ensure Playwright Chromium is installed: `playwright install chromium`.")
+            st.info("Ensure Playwright Chromium is installed in the deployment environment.")
         elif search_response.status == SearchStatus.PARSER_FAILURE:
             st.error(f"⚠️ **Parser Notice**: {search_response.error or 'Results page loaded, but candidates could not be extracted.'}")
-            st.info("💡 Try switching to another provider in the sidebar.")
+            st.info("💡 Switch to **'bing'** or **'auto'** in the sidebar.")
         elif search_response.status == SearchStatus.NETWORK_ERROR:
             st.error(f"🌐 **Network Error**: {search_response.error}")
+            st.info("💡 Switch to **'bing'** or **'auto'** in the sidebar.")
         elif provider_name == "auto":
             st.error(search_response.error or "No candidates discovered across attempted providers.")
+            st.info("💡 Try selecting **'bing'** directly in the sidebar or test with another portrait photo.")
         else:
             st.warning(f"ℹ️ **{provider_name.capitalize()} search completed**, but no usable candidates were discovered.")
-            st.info("💡 You can try a different search provider in the sidebar or upload a different reference photo.")
+            st.info("💡 Try selecting **'bing'** or **'auto'** in the sidebar or upload a different reference photo.")
         st.stop()
 
     if provider_name == "auto":

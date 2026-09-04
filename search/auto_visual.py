@@ -34,9 +34,9 @@ class AutoVisualProvider(SearchProvider):
         logger.info("Starting Auto Visual Search cascade (Google Lens -> Bing Visual -> Yandex Visual)...")
 
         cascade_providers = [
-            ("google", GoogleLensProvider()),
             ("bing", BingVisualProvider()),
             ("yandex", YandexVisualProvider()),
+            ("google", GoogleLensProvider()),
         ]
 
         attempt_summaries = []

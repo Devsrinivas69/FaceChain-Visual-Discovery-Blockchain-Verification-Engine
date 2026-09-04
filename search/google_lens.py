@@ -101,12 +101,16 @@ class GoogleLensProvider(SearchProvider):
 
                 try:
                     logger.info("Navigating to Google Lens interface...")
-                    try:
-                        page.goto("https://lens.google.com/upload", timeout=SEARCH_TIMEOUT_MS, wait_until="domcontentloaded")
-                    except Exception as e:
-                        logger.warning(f"Lens upload page slow ({e}), fallback to images.google.com...")
-                        page.goto("https://images.google.com", timeout=SEARCH_TIMEOUT_MS, wait_until="domcontentloaded")
+                    # Route abort landing page media for fast commit
+                    page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] and "search" not in page.url else route.continue_())
 
+                    try:
+                        page.goto("https://images.google.com", timeout=15000, wait_until="commit")
+                    except Exception as e:
+                        logger.warning(f"Google images navigation commit slow ({e}), trying lens.google.com...")
+                        page.goto("https://lens.google.com/upload", timeout=15000, wait_until="commit")
+
+                    page.wait_for_timeout(1000)
                     self._dismiss_consent_popups(page)
 
                     # Check for bot challenge
@@ -115,7 +119,7 @@ class GoogleLensProvider(SearchProvider):
                             provider="google",
                             status=SearchStatus.PROVIDER_BLOCKED,
                             elapsed_seconds=round(time.time() - t0, 2),
-                            error="Google presented a CAPTCHA/unusual traffic challenge.",
+                            error="Google presented a CAPTCHA challenge in this cloud environment. Cloud datacenter IPs are frequently restricted by Google Lens. Switch to 'bing' in the sidebar.",
                         )
 
                     file_input = page.query_selector('input[type="file"]')
@@ -131,12 +135,17 @@ class GoogleLensProvider(SearchProvider):
                             provider="google",
                             status=SearchStatus.PARSER_FAILURE,
                             elapsed_seconds=round(time.time() - t0, 2),
-                            error="Could not locate image upload element on Google Lens.",
+                            error="Could not locate image upload element on Google Lens. Cloud datacenter IPs are frequently restricted by Google. Switch to 'bing' in the sidebar.",
                         )
 
                     logger.info(f"Uploading query image: {path_obj.name}")
+                    try:
+                        page.unroute("**/*")
+                    except Exception:
+                        pass
+
                     file_input.set_input_files(str(path_obj))
-                    page.wait_for_timeout(4000)
+                    page.wait_for_timeout(3500)
 
                     try:
                         page.wait_for_selector('a[href^="http"]', timeout=15000)
