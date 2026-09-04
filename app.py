@@ -111,6 +111,14 @@ def _image_bytes_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
+def safe_st_image(image, caption: Optional[str] = None) -> None:
+    """Safely displays an image stretched to container width without deprecation warnings."""
+    try:
+        st.image(image, caption=caption, width="stretch")
+    except (TypeError, ValueError):
+        st.image(image, caption=caption, use_container_width=True)
+
+
 def render_candidate_card(c: CandidateResult) -> None:
     """
     Safely renders a CandidateResult card in the Streamlit UI.
@@ -121,7 +129,7 @@ def render_candidate_card(c: CandidateResult) -> None:
     if c.local_path and Path(c.local_path).is_file():
         try:
             with Image.open(c.local_path) as img:
-                st.image(img, use_container_width=True)
+                safe_st_image(img)
                 img_rendered = True
         except Exception:
             pass
@@ -130,7 +138,7 @@ def render_candidate_card(c: CandidateResult) -> None:
         preview_url = c.thumbnail_url or c.image_url
         if preview_url:
             try:
-                st.image(preview_url, use_container_width=True)
+                safe_st_image(preview_url)
                 img_rendered = True
             except Exception:
                 pass
@@ -184,15 +192,15 @@ with col1:
             with open(save_path, "wb") as fh:
                 fh.write(uploaded.getbuffer())
             selected_path = save_path
-            st.image(uploaded, caption="Uploaded Image", use_container_width=True)
+            safe_st_image(uploaded, caption="Uploaded Image")
     else:
         selected_path = config.INPUT_DIR / choice
-        st.image(str(selected_path), caption=choice, use_container_width=True)
+        safe_st_image(str(selected_path), caption=choice)
 
 with col2:
     st.subheader("2. Detection & ArcFace Embedding")
     if not (selected_path and selected_path.is_file()):
-        st.warning("Please select or upload a reference portrait to begin.")
+        st.info("ℹ️ Select a demo portrait above or upload a photo to begin.")
         st.stop()
 
     # Detect if image changed → reset pipeline results
@@ -482,13 +490,13 @@ with b_col1:
     if best.local_path and Path(best.local_path).is_file():
         try:
             with Image.open(best.local_path) as img:
-                st.image(img, caption=f"{best.source_domain}", use_container_width=True)
+                safe_st_image(img, caption=f"{best.source_domain}")
                 img_shown = True
         except Exception:
             pass
     if not img_shown and (best.thumbnail_url or best.image_url):
         try:
-            st.image(best.thumbnail_url or best.image_url, caption=f"{best.source_domain}", use_container_width=True)
+            safe_st_image(best.thumbnail_url or best.image_url, caption=f"{best.source_domain}")
             img_shown = True
         except Exception:
             pass
