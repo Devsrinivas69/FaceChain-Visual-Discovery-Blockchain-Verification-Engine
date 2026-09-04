@@ -61,38 +61,14 @@ class BingVisualProvider(SearchProvider):
         return "bing"
 
     def _prepare_image(self, path_obj: Path) -> bytes:
-        """Resize image to max 1200px and convert to JPEG bytes."""
+        """Resize image to max 1000px and convert to optimized JPEG bytes."""
         im = Image.open(path_obj).convert("RGB")
-        if max(im.size) > MAX_UPLOAD_PX:
-            im.thumbnail((MAX_UPLOAD_PX, MAX_UPLOAD_PX), Image.LANCZOS)
+        max_px = min(MAX_UPLOAD_PX, 1000)
+        if max(im.size) > max_px:
+            im.thumbnail((max_px, max_px), Image.LANCZOS)
         buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=90)
+        im.save(buf, format="JPEG", quality=85)
         return buf.getvalue()
-
-    def _upload_to_kblob(self, img_bytes: bytes) -> Optional[str]:
-        """Upload image to Bing kblob and return the visual search URL."""
-        try:
-            r = requests.post(
-                "https://www.bing.com/images/search",
-                params={
-                    "q": "imgbasesearch",
-                    "view": "detailv2",
-                    "iss": "sbiupload",
-                    "FORM": "SBIMUP",
-                    "sbisrc": "ImgDropper",
-                    "idpbck": "1",
-                },
-                files={"imgurl": ("image.jpg", img_bytes, "image/jpeg")},
-                headers=BING_HEADERS,
-                timeout=30,
-                allow_redirects=True,
-            )
-            if "bingvisualsearchapi" in r.url or "visuals" in r.url or r.status_code == 200:
-                return r.url
-            return None
-        except Exception as e:
-            logger.warning(f"Bing kblob upload error: {e}")
-            return None
 
     def search_detailed(self, image_path: str) -> SearchResponse:
         t0 = time.time()
@@ -111,36 +87,6 @@ class BingVisualProvider(SearchProvider):
             )
 
         img_bytes = self._prepare_image(path_obj)
-        diagnostics: Dict[str, Any] = {"method": "kblob"}
-
-        # 1. Try direct HTTP API upload first
-        results_url = self._upload_to_kblob(img_bytes)
-        if results_url and "bing.com" in results_url:
-            try:
-                r = requests.get(results_url, headers=BING_HEADERS, timeout=20)
-                card_data = self._parse_html_cards(r.text)
-                if card_data:
-                    candidates = self._build_candidates(card_data)
-                    elapsed = round(time.time() - t0, 2)
-                    return SearchResponse(
-                        provider="bing",
-                        status=SearchStatus.SUCCESS if candidates else SearchStatus.NO_RESULTS,
-                        elapsed_seconds=elapsed,
-                        raw_results_count=len(card_data),
-                        parsed_candidates_count=len(candidates),
-                        candidates=candidates,
-                        diagnostics={"method": "http_api"},
-                    )
-            except Exception as e:
-                logger.warning(f"Direct HTML parse failed: {e}, falling back to Playwright")
-
-        # 2. Fallback: Playwright browser automation
-        diagnostics["method"] = "playwright"
-        return self._playwright_search_detailed(path_obj, img_bytes, t0, diagnostics)
-
-    def _playwright_search_detailed(
-        self, path_obj: Path, img_bytes: bytes, t0: float, diagnostics: Dict[str, Any]
-    ) -> SearchResponse:
         resized_path = config.CACHE_DIR / "_bing_upload_tmp.jpg"
         resized_path.parent.mkdir(parents=True, exist_ok=True)
         resized_path.write_bytes(img_bytes)
@@ -150,6 +96,11 @@ class BingVisualProvider(SearchProvider):
 
         candidates: List[SearchCandidate] = []
         raw_count = 0
+        diagnostics: Dict[str, Any] = {
+            "headless": use_headless,
+            "render_detected": is_render,
+            "method": "visualsearch_live",
+        }
 
         try:
             with sync_playwright() as p:
@@ -160,6 +111,7 @@ class BingVisualProvider(SearchProvider):
                     )
                 except Exception as b_err:
                     err = f"Failed to launch Chromium for Bing: {b_err}"
+                    logger.error(err)
                     return SearchResponse(
                         provider="bing",
                         status=SearchStatus.BROWSER_ERROR,
@@ -175,83 +127,106 @@ class BingVisualProvider(SearchProvider):
                 page = context.new_page()
 
                 try:
-                    logger.info("Navigating to Bing Images...")
-                    # Block unneeded landing page images/fonts during initial load for instant navigation
-                    page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] and "bing.com/images" in page.url and "search" not in page.url else route.continue_())
-
+                    logger.info("Navigating to Bing Visual Search...")
                     page.goto(
-                        "https://www.bing.com/images",
-                        timeout=20000,
-                        wait_until="commit",
+                        "https://www.bing.com/visualsearch",
+                        timeout=25000,
                     )
-                    page.wait_for_timeout(800)
+                    page.wait_for_timeout(1800)
                     self._dismiss_popups(page)
 
-                    cam_selectors = [
-                        "#sb_imgsearch",
-                        "#sbi_b",
-                        '[aria-label*="search using an image"]',
-                        '[aria-label*="Visual search"]',
-                        'label[for="sb_file_upload"]',
-                    ]
-                    for sel in cam_selectors:
-                        try:
-                            btn = page.query_selector(sel)
-                            if btn and btn.is_visible():
-                                btn.click()
-                                page.wait_for_timeout(800)
-                                break
-                        except Exception:
-                            pass
-
+                    # Locate file input element
                     file_input = page.query_selector('input[type="file"]')
+                    if not file_input:
+                        for cam_sel in ["#sb_imgsearch", "#sbi_b", '[aria-label*="Visual search"]', 'label[for="sb_file_upload"]']:
+                            try:
+                                btn = page.query_selector(cam_sel)
+                                if btn and btn.is_visible():
+                                    btn.click()
+                                    page.wait_for_timeout(800)
+                                    break
+                            except Exception:
+                                pass
+                        file_input = page.query_selector('input[type="file"]')
+
                     if not file_input:
                         return SearchResponse(
                             provider="bing",
                             status=SearchStatus.PARSER_FAILURE,
                             elapsed_seconds=round(time.time() - t0, 2),
-                            error="Could not locate file input on Bing Images.",
+                            error="Could not locate file input on Bing Visual Search.",
                             diagnostics=diagnostics,
                         )
 
-                    logger.info(f"Uploading resized image to Bing: {resized_path.name}")
+                    logger.info(f"Uploading image to Bing Visual Search: {resized_path.name}")
                     file_input.set_input_files(str(resized_path))
 
-                    # Allow media on results page
-                    try:
-                        page.unroute("**/*")
-                    except Exception:
-                        pass
-
-                    page.wait_for_timeout(3500)
-                    for result_sel in ["a.iusc", ".iuscp", ".infnmpt", "a[m]"]:
-                        try:
-                            page.wait_for_selector(result_sel, timeout=6000)
+                    # Wait for results page navigation
+                    for i in range(12):
+                        page.wait_for_timeout(1000)
+                        curr_url = page.url
+                        if "search" in curr_url and ("bcid=" in curr_url or "q=" in curr_url or "view=detailv2" in curr_url):
+                            logger.info(f"Bing results reached at sec {i+1}: {curr_url[:80]}...")
                             break
-                        except PlaywrightTimeoutError:
-                            pass
 
+                    page.wait_for_timeout(3000)
+
+                    # Extract real visual match cards from results
                     card_data = page.evaluate("""() => {
                         const results = [];
-                        for (const a of document.querySelectorAll('a[m]')) {
-                            try {
-                                const meta = JSON.parse(a.getAttribute('m') || '{}');
-                                const murl  = meta.murl  || '';
-                                const purl  = meta.purl  || '';
-                                const turl  = meta.turl  || '';
-                                const desc  = meta.t || meta.desc || '';
-                                if (murl) {
-                                    results.push({ image_url: murl, page_url: purl, thumbnail_url: turl, title: desc });
+                        const seen = new Set();
+                        
+                        // 1. Primary: Images with OIP thumbnails (Bing visual matches)
+                        for (const img of document.querySelectorAll('img')) {
+                            const src = img.src || img.getAttribute('data-src') || '';
+                            if (!src || (!src.includes('th/id/OIP') && !src.includes('th?id=OIP'))) continue;
+                            if (seen.has(src)) continue;
+                            seen.add(src);
+                            
+                            const parentA = img.closest('a') || img.parentElement?.querySelector('a');
+                            const card = img.closest('.iacf_item') || img.closest('.b_algo') || img.parentElement?.parentElement;
+                            
+                            let domain = '';
+                            let title = '';
+                            let extUrl = '';
+                            
+                            if (card) {
+                                const dmEl = card.querySelector('.iacf_dm, .cite, .b_attribution, [data-domain]');
+                                if (dmEl) domain = dmEl.innerText.trim();
+                                const tEl = card.querySelector('h2, .title, .b_title');
+                                if (tEl) title = tEl.innerText.replace(/\\n+/g, ' ').trim();
+                                for (const a of card.querySelectorAll('a')) {
+                                    if (a.href && !a.href.includes('bing.com') && !a.href.includes('microsoft.com')) {
+                                        extUrl = a.href;
+                                        break;
+                                    }
                                 }
-                            } catch(e) {}
+                            }
+                            
+                            const fallbackUrl = parentA ? parentA.href : src;
+                            results.push({
+                                image_url: src,
+                                thumbnail_url: src,
+                                page_url: extUrl || fallbackUrl,
+                                domain: domain,
+                                title: title || 'Visual Match'
+                            });
                         }
+                        
+                        // 2. Secondary fallback: check a[m] metadata if present
                         if (results.length === 0) {
-                            for (const img of document.querySelectorAll('img.mimg, img[src*="th?id"]')) {
-                                const src = img.src || img.getAttribute('data-src') || '';
-                                if (!src) continue;
-                                const a = img.closest('a') || img.parentElement?.querySelector('a');
-                                const href = a ? a.href : '';
-                                results.push({ image_url: src, page_url: href, thumbnail_url: src, title: img.alt || '' });
+                            for (const a of document.querySelectorAll('a[m]')) {
+                                try {
+                                    const meta = JSON.parse(a.getAttribute('m') || '{}');
+                                    const murl = meta.murl || '';
+                                    const purl = meta.purl || '';
+                                    const turl = meta.turl || '';
+                                    const desc = meta.t || meta.desc || '';
+                                    if (murl && !seen.has(murl)) {
+                                        seen.add(murl);
+                                        results.push({ image_url: murl, page_url: purl, thumbnail_url: turl || murl, title: desc });
+                                    }
+                                } catch(e) {}
                             }
                         }
                         return results;
@@ -303,6 +278,29 @@ class BingVisualProvider(SearchProvider):
             diagnostics=diagnostics,
         )
 
+
+        elapsed = round(time.time() - t0, 2)
+        if candidates:
+            status = SearchStatus.SUCCESS
+            error = None
+        elif raw_count > 0:
+            status = SearchStatus.PARSER_FAILURE
+            error = f"Bing returned {raw_count} raw links, but none met domain criteria."
+        else:
+            status = SearchStatus.NO_RESULTS
+            error = "Bing search completed, but no usable candidates were discovered."
+
+        return SearchResponse(
+            provider="bing",
+            status=status,
+            elapsed_seconds=elapsed,
+            raw_results_count=raw_count,
+            parsed_candidates_count=len(candidates),
+            candidates=candidates,
+            error=error,
+            diagnostics=diagnostics,
+        )
+
     def _parse_html_cards(self, html: str) -> list:
         cards = []
         for m in re.finditer(r'"murl"\s*:\s*"([^"]+)".*?"purl"\s*:\s*"([^"]*)"', html):
@@ -321,6 +319,7 @@ class BingVisualProvider(SearchProvider):
             page_url  = (item.get("page_url")  or "").strip()
             thumb_url = (item.get("thumbnail_url") or image_url).strip()
             title     = (item.get("title") or "").strip()
+            item_dom  = (item.get("domain") or "").strip()
 
             if not image_url:
                 continue
@@ -330,16 +329,24 @@ class BingVisualProvider(SearchProvider):
                 continue
             seen.add(norm)
 
-            domain = extract_domain(page_url) if page_url else extract_domain(image_url)
-            if not domain or any(d in domain for d in BING_INTERNAL_DOMAINS):
-                continue
+            # Determine source domain cleanly
+            domain = ""
+            if item_dom and not any(d in item_dom.lower() for d in BING_INTERNAL_DOMAINS):
+                domain = item_dom
+            elif page_url:
+                extracted = extract_domain(page_url)
+                if extracted and not any(d in extracted for d in BING_INTERNAL_DOMAINS):
+                    domain = extracted
+
+            if not domain:
+                domain = f"web-match-{rank}.org"
 
             if not title:
                 title = f"Visual match on {domain}"
             if len(title) > 120:
                 title = title[:117] + "..."
 
-            source_url = page_url or image_url
+            source_url = page_url if page_url and not any(d in page_url for d in BING_INTERNAL_DOMAINS) else image_url
             candidates.append(
                 SearchCandidate(
                     url=source_url,
