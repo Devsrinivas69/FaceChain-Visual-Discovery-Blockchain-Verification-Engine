@@ -58,10 +58,6 @@ CHROMIUM_SERVER_ARGS = [
 BLOCKED_URL_PATTERNS = [
     "bat.bing.com",
     "clarity.ms",
-    "c.bing.com",
-    "bing.com/fd/ls",
-    "OneCollector",
-    "explore.microsoft.com",
     "js.monitor.azure.com",
 ]
 
@@ -157,42 +153,46 @@ class BingVisualProvider(SearchProvider):
                 )
                 page = context.new_page()
 
-                # Block analytics/telemetry hosts to prevent network hangs
-                def _route_handler(route):
-                    url = route.request.url
-                    if any(pattern in url for pattern in BLOCKED_URL_PATTERNS):
-                        route.abort()
-                    else:
-                        route.continue_()
 
-                page.route("**/*", _route_handler)
 
                 try:
-                    logger.info("Navigating to https://www.bing.com/images ...")
-                    page.goto(
-                        "https://www.bing.com/images",
-                        wait_until="domcontentloaded",
-                        timeout=12000,
-                    )
-                    logger.info(f"Bing images loaded in {time.time()-t0:.2f}s")
+                    logger.info("Navigating to Bing Visual Search...")
+                    # Try dedicated visual search portal first (explore.microsoft.com / bing.com/visualsearch)
+                    # which provides a direct, highly reliable upload input
+                    nav_ok = False
+                    try:
+                        page.goto(
+                            "https://www.bing.com/visualsearch",
+                            wait_until="domcontentloaded",
+                            timeout=12000,
+                        )
+                        nav_ok = True
+                    except Exception as e:
+                        logger.warning(f"visualsearch portal navigation failed ({e}), falling back to images...")
+                        page.goto(
+                            "https://www.bing.com/images",
+                            wait_until="domcontentloaded",
+                            timeout=12000,
+                        )
 
-                    # Dismiss cookie/consent popup if present
+                    logger.info(f"Bing initial page loaded in {time.time()-t0:.2f}s (URL: {page.url[:60]})")
                     self._dismiss_popups(page)
+                    page.wait_for_timeout(2000)
 
-                    # Click the camera (visual search) button to reveal file input
-                    cam_sel = (
-                        "#sb_imgsearch, #sbi_b, "
-                        '[aria-label*="Visual search"], '
-                        '[aria-label*="Search using an image"]'
-                    )
-                    cam = page.query_selector(cam_sel)
-                    if cam:
-                        cam.click()
-                        page.wait_for_timeout(500)
-
-                    # Locate file input — may be hidden so use state="attached"
+                    # Locate file input — on visualsearch portal it is directly present;
+                    # on images home, click the camera button first
                     file_input = page.query_selector('input[type="file"]')
                     if not file_input:
+                        cam_sel = (
+                            "#sb_imgsearch, #sbi_b, "
+                            '[aria-label*="Visual search"], '
+                            '[aria-label*="Search using an image"]'
+                        )
+                        cam = page.query_selector(cam_sel)
+                        if cam:
+                            cam.click()
+                            page.wait_for_timeout(500)
+
                         try:
                             file_input = page.wait_for_selector(
                                 'input[type="file"]',
@@ -207,23 +207,22 @@ class BingVisualProvider(SearchProvider):
                             provider="bing",
                             status=SearchStatus.PARSER_FAILURE,
                             elapsed_seconds=round(time.time() - t0, 2),
-                            error="Could not locate file upload input on Bing Images.",
+                            error="Could not locate file upload input on Bing.",
                             diagnostics=diagnostics,
                         )
 
                     logger.info(f"Uploading image ({upload_path.stat().st_size} bytes)...")
                     file_input.set_input_files(str(upload_path))
 
-                    # Wait for results page URL (bcid= param indicates image search landed)
+                    # Wait for results page URL (bcid= or search? param indicates results landed)
                     logger.info("Waiting for Bing search results...")
                     results_reached = False
-                    for i in range(10):
+                    for i in range(12):
                         page.wait_for_timeout(1000)
                         curr_url = page.url
                         if (
                             "bcid=" in curr_url
-                            or "images/search" in curr_url
-                            or ("search?" in curr_url and "q=" in curr_url)
+                            or ("search?" in curr_url and ("q=" in curr_url or "bcid=" in curr_url))
                         ):
                             results_reached = True
                             logger.info(
@@ -233,20 +232,44 @@ class BingVisualProvider(SearchProvider):
 
                     if not results_reached:
                         logger.warning(
-                            f"Bing results URL not reached after 10s. Current URL: {page.url[:80]}"
+                            f"Bing search results page not reached. Stayed at: {page.url[:80]}"
+                        )
+                        # NEVER scrape the landing/home page — return NO_RESULTS cleanly
+                        return SearchResponse(
+                            provider="bing",
+                            status=SearchStatus.NO_RESULTS,
+                            elapsed_seconds=round(time.time() - t0, 2),
+                            raw_results_count=0,
+                            parsed_candidates_count=0,
+                            candidates=[],
+                            error="Bing visual search did not navigate to results page. No visual search results were returned.",
+                            diagnostics=diagnostics,
                         )
 
-                    # Give page extra 1.5s to render results
-                    page.wait_for_timeout(1500)
+                    # Give results page 2.5s to render cards and images
+                    page.wait_for_timeout(2500)
 
-                    # Extract results: organic web results + OIP image thumbnails
+                    # Extract results: organic web results + visual match cards
                     raw_items = page.evaluate("""() => {
                         const out = [];
                         const seen = new Set();
 
-                        // 1. Organic web results (.b_algo) with thumbnails
+                        // Helper to extract JSON from m attribute if available
+                        function getPurl(el) {
+                            if (!el) return '';
+                            const m = el.getAttribute('m');
+                            if (m) {
+                                try {
+                                    const parsed = JSON.parse(m);
+                                    if (parsed && parsed.purl) return parsed.purl;
+                                } catch(e) {}
+                            }
+                            return '';
+                        }
+
+                        // 1. Organic web results (.b_algo)
                         for (const algo of document.querySelectorAll('.b_algo, li.b_algo')) {
-                            const a = algo.querySelector('h2 a, a[href*="/ck/a"], a');
+                            const a = algo.querySelector('h2 a, a[href*="/ck/a"], a[href^="http"]');
                             const h2 = algo.querySelector('h2, .b_algo_title, .b_title');
                             const img = algo.querySelector('img');
                             const href = a ? a.href : '';
@@ -258,27 +281,40 @@ class BingVisualProvider(SearchProvider):
                             }
                         }
 
-                        // 2. Visual image matches with OIP thumbnails
-                        for (const img of document.querySelectorAll('img')) {
-                            const src = img.src || img.getAttribute('data-src') || '';
-                            if (!src) continue;
-                            const isOIP = src.includes('th.bing.com/th/id/OIP') || src.includes('th?id=OIP');
-                            if (!isOIP) continue;
-                            if (seen.has(src)) continue;
-                            seen.add(src);
+                        // 2. Visual image match cards inside dedicated result containers
+                        const CARD_SELECTORS = [
+                            '.iacf_item',
+                            '.richCard',
+                            '.mm_item',
+                            '.b_imagePair',
+                            '.imgpt',
+                            '[class*="iuscp"]',
+                            '[class*="imgContainer"]',
+                            '[class*="img_info"]',
+                        ];
 
-                            const parentA = img.closest('a');
-                            const card = img.closest('.iacf_item, .b_algo, .richCard, .mm_item');
-                            let title = '';
-                            if (card) {
-                                const t = card.querySelector('h2, .title, .b_title, .caption');
-                                if (t) title = t.innerText.replace(/\\n+/g, ' ').trim();
+                        for (const sel of CARD_SELECTORS) {
+                            for (const card of document.querySelectorAll(sel)) {
+                                const img = card.querySelector('img');
+                                if (!img) continue;
+                                const src = img.src || img.getAttribute('data-src') || '';
+                                if (!src) continue;
+
+                                const parentA = img.closest('a') || card.querySelector('a');
+                                const purl = getPurl(card) || getPurl(parentA);
+                                const href = purl || (parentA ? parentA.href : '');
+
+                                const key = href || src;
+                                if (seen.has(key)) continue;
+                                seen.add(key);
+
+                                const t = card.querySelector(
+                                    'h2, .title, .b_title, .caption, [class*="caption"], [class*="title"]'
+                                );
+                                const title = t ? t.innerText.replace(/\\n+/g, ' ').trim() : 'Visual Match';
+
+                                out.push({href, title, imgSrc: src});
                             }
-                            out.push({
-                                href: parentA ? parentA.href : '',
-                                title: title || 'Visual Match',
-                                imgSrc: src
-                            });
                         }
 
                         return out;
@@ -351,49 +387,39 @@ class BingVisualProvider(SearchProvider):
             img_src = (item.get("imgSrc") or "").strip()
             title = (item.get("title") or "").strip()
 
-            # Decode Bing's obfuscated redirect URLs
+            # Decode Bing's obfuscated redirect URLs (/ck/a?...)
             decoded_url = _decode_bing_redirect(raw_href)
-
-            # Prefer the decoded external URL; fall back to image URL
-            page_url = decoded_url if (decoded_url and not any(d in decoded_url for d in BING_INTERNAL_DOMAINS)) else ""
-            source_url = page_url or img_src
-
-            if not source_url:
+            if not decoded_url or not decoded_url.startswith("http"):
                 continue
 
-            norm = normalize_url(source_url)
+            # Skip Bing / Microsoft internal URLs
+            if any(d in decoded_url for d in BING_INTERNAL_DOMAINS):
+                continue
+
+            domain = extract_domain(decoded_url)
+            if not domain or any(d in domain for d in BING_INTERNAL_DOMAINS):
+                continue
+
+            norm = normalize_url(decoded_url)
             if norm in seen:
                 continue
             seen.add(norm)
-
-            domain = ""
-            if page_url:
-                extracted = extract_domain(page_url)
-                if extracted and not any(d in extracted for d in BING_INTERNAL_DOMAINS):
-                    domain = extracted
-            if not domain and img_src:
-                extracted = extract_domain(img_src)
-                if extracted and not any(d in extracted for d in BING_INTERNAL_DOMAINS):
-                    domain = extracted
-            if not domain:
-                domain = f"web-match-{rank}.org"
 
             if not title:
                 title = f"Visual match on {domain}"
             if len(title) > 120:
                 title = title[:117] + "..."
 
-            # Only keep the thumbnail if it's from bing CDN (OIP = real thumbnail)
-            thumb = img_src if (img_src and "th.bing.com" in img_src) else ""
+            thumb = img_src if img_src.startswith("http") else None
 
             candidates.append(
                 SearchCandidate(
-                    url=source_url,
+                    url=decoded_url,
                     title=title,
                     source_domain=domain,
                     search_rank=rank,
-                    thumbnail_url=thumb or None,
-                    image_url=img_src or None,
+                    thumbnail_url=thumb,
+                    image_url=thumb,
                 )
             )
             rank += 1

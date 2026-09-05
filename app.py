@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,8 +34,11 @@ from pipeline.models import CandidateResult, CandidateStatus
 from pipeline.executor import run_candidate_evaluation, get_matches
 from extraction.metadata import build_matched_record
 from fingerprint.canonical import create_canonical_manifest, compute_provenance_hash, to_bytes32_hex
+from fingerprint.hashing import compute_image_sha256
 from blockchain.client import BlockchainClient, BlockchainError
 from blockchain.verifier import verify_content, run_tamper_demonstration
+
+logger = logging.getLogger(__name__)
 
 # ─── Page Config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -123,10 +128,32 @@ def safe_st_image(image, caption: Optional[str] = None) -> None:
 def render_candidate_card(c: CandidateResult) -> None:
     """
     Safely renders a CandidateResult card in the Streamlit UI.
-    Attempts local cached image first, then thumbnail or direct URL.
+
+    Priority:
+      1. local_path — the image that was actually downloaded and face-evaluated.
+      2. thumbnail_url / image_url — ONLY when the URL is a genuine direct image
+         (not a search-engine CDN redirect that shows an unrelated thumbnail).
+
+    We deliberately skip Bing/Yandex CDN thumbnails (th.bing.com, yastatic.net,
+    etc.) when no local file is available, because those CDN URLs frequently
+    resolve to images that have nothing to do with the candidate page.
     """
+    _CDN_NOISE = (
+        "th.bing.com/th/id/OIP",
+        "th.bing.com/th?id=OIP",
+        "th.bing.com/th/id/OIG",
+        "yastatic.net",
+        "yandex.net/i/",
+    )
+
+    def _is_cdn_noise(url: str) -> bool:
+        """True when the URL is a search-engine CDN thumbnail, not the real image."""
+        return url and any(p in url for p in _CDN_NOISE)
+
     # Image preview
     img_rendered = False
+
+    # ── Priority 1: locally downloaded & validated image ──────────────────────
     if c.local_path and Path(c.local_path).is_file():
         try:
             with Image.open(c.local_path) as img:
@@ -135,17 +162,30 @@ def render_candidate_card(c: CandidateResult) -> None:
         except Exception:
             pass
 
+    # ── Priority 2: direct image URL (non-CDN-noise only) ────────────────────
     if not img_rendered:
-        preview_url = c.thumbnail_url or c.image_url
-        if preview_url:
+        for candidate_url in [c.image_url, c.thumbnail_url]:
+            if not candidate_url:
+                continue
+            if _is_cdn_noise(candidate_url):
+                # Skip: this is a Bing/Yandex CDN thumbnail, not the real image.
+                continue
             try:
-                safe_st_image(preview_url)
+                safe_st_image(candidate_url)
                 img_rendered = True
+                break
             except Exception:
-                pass
+                continue
 
+    # ── Fallback: text placeholder ────────────────────────────────────────────
     if not img_rendered:
-        st.caption("📷 Image preview unavailable")
+        st.markdown(
+            f"<div style='background:#1e1e2e;border-radius:8px;padding:24px 12px;"
+            f"text-align:center;color:#888;font-size:0.82em;'>"
+            f"🌐 <b>{c.source_domain}</b><br><span style='font-size:0.9em;'>Image not available locally</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
     # Metadata
     st.markdown(f"**Domain:** `{c.source_domain}`")
@@ -333,6 +373,31 @@ if st.button("🚀 Run Visual Search & Verification Pipeline", type="primary"):
         "search_status": search_response.status.value,
     }
 
+    # Save search_run.json to output directory
+    output_run_data = {
+        "search_run_id": search_run_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "provider_requested": provider_name,
+        "provider_used": provider_used,
+        "diagnostics": diagnostics,
+        "reference_image": str(selected_path),
+        "matches_count": len(matches),
+        "all_candidates_count": len(all_candidates),
+        "candidates": [c.to_dict() for c in all_candidates],
+    }
+    try:
+        run_json_path = config.OUTPUT_DIR / "search_run.json"
+        with open(run_json_path, "w", encoding="utf-8") as f:
+            json.dump(output_run_data, f, indent=2)
+    except Exception as e:
+        pass
+
+    # Safety guard: ensure no mock domains appear in results
+    for c in all_candidates:
+        if "web-match-" in (c.source_domain or "") or "web-match-" in (c.source_url or ""):
+            st.error(f"🛑 Security violation: Mock domain detected: `{c.source_domain}`")
+            st.stop()
+
     # Serialize CandidateResult objects to plain dicts for session state
     st.session_state["pipeline_results"] = {
         "all_candidates": [c.to_dict() for c in all_candidates],
@@ -478,56 +543,75 @@ candidates_with_faces = sorted(
     reverse=True,
 )
 
+proceed_to_blockchain = False
+
 if matches:
     best = matches[0]
+    proceed_to_blockchain = True
     st.success(
-        f"✓ Confirmed Match: **{best.source_domain}** — "
+        f"✅ **Confirmed Match:** `{best.source_domain}` — "
         f"Face Similarity: **{format_similarity(best.face_similarity)}** "
         f"({best.faces_count} face(s) verified in image)"
     )
 elif candidates_with_faces:
     best = candidates_with_faces[0]
-    st.info(
-        f"🎯 Top Discovered Face Match: **{best.source_domain}** — "
-        f"Face Similarity: **{format_similarity(best.face_similarity)}** "
-        f"(Highest similarity among {len(candidates_with_faces)} detected face candidates)"
+    st.warning(
+        f"⚠️ **Below-Threshold Match:** Top candidate on `{best.source_domain}` has similarity "
+        f"**{best.face_similarity:.3f}** (Threshold is **≥{threshold_used:.2f}**). "
+        f"No candidates met the threshold."
     )
-elif all_candidates:
-    best = all_candidates[0]
-    st.info(
-        f"🔍 Top Visual Discovery Candidate: **{best.source_domain}** "
-        f"(Visual rank #{best.search_rank} from {best.search_provider})"
-    )
+    st.info("💡 You can adjust the threshold slider in the sidebar, or manually confirm below to anchor.")
+    if st.checkbox("Force blockchain anchoring for top face candidate anyway"):
+        proceed_to_blockchain = True
+    else:
+        st.caption("ℹ️ Blockchain anchoring paused because no candidate met the match threshold.")
 else:
-    st.info("No candidates to analyze for provenance.")
+    st.warning("⚠️ **No Face Matches Found:** Search candidates were discovered, but none contained a verified human face.")
+    st.info("ℹ️ Visual discovery completed, but no face match exists. Blockchain anchoring is skipped.")
+    best = None
+
+if not best:
     st.stop()
 
-b_col1, b_col2 = st.columns([1, 2])
+# Side-by-side comparison: Reference Portrait vs Matched Web Image
+b_col1, b_col2, b_col3 = st.columns([1.2, 1.2, 2])
+
 with b_col1:
+    st.markdown("**1. Query Reference Portrait**")
+    if selected_path and Path(selected_path).is_file():
+        safe_st_image(str(selected_path), caption="Reference Query")
+
+with b_col2:
+    st.markdown(f"**2. Matched Face (`{best.source_domain}`)**")
     img_shown = False
     if best.local_path and Path(best.local_path).is_file():
         try:
             with Image.open(best.local_path) as img:
-                safe_st_image(img, caption=f"{best.source_domain}")
+                safe_st_image(img, caption=f"Web Candidate (sim={best.face_similarity:.3f})")
                 img_shown = True
         except Exception:
             pass
     if not img_shown and (best.thumbnail_url or best.image_url):
         try:
-            safe_st_image(best.thumbnail_url or best.image_url, caption=f"{best.source_domain}")
+            safe_st_image(best.thumbnail_url or best.image_url, caption=f"Web Candidate (sim={best.face_similarity:.3f})")
             img_shown = True
         except Exception:
             pass
     if not img_shown:
-        st.caption("📷 Image preview unavailable")
+        st.caption("📷 Image preview unavailable locally")
 
-with b_col2:
+with b_col3:
+    st.markdown("**3. Match Metadata & Metrics**")
     st.write("**Source URL:**", best.source_url)
     st.write("**Domain:**", f"`{best.source_domain}`")
     st.write("**Face Similarity:**", f"`{best.face_similarity:.4f}` ({format_similarity(best.face_similarity)})")
     st.write("**Faces in image:**", best.faces_count)
     st.write("**Search Rank:**", f"#{best.search_rank}")
     st.write("**Candidate ID:**", f"`{best.candidate_id}`")
+    st.write("**Match Classification:**", "✅ CONFIRMED MATCH" if best.is_match else "⚠️ BELOW THRESHOLD")
+
+if not proceed_to_blockchain:
+    st.stop()
 
 # ── Section 6: Content Fingerprint ───────────────────────────────────────────
 st.subheader("6. Content Fingerprint (Canonical SHA-256)")
@@ -691,8 +775,8 @@ if st.button("🧪 Simulate Content Tampering (Modify 3 Pixels)", type="secondar
     target_img_path = None
     if best.local_path and Path(best.local_path).is_file():
         target_img_path = Path(best.local_path)
-    elif Path(image_path).is_file():
-        target_img_path = Path(image_path)
+    elif selected_path and Path(selected_path).is_file():
+        target_img_path = Path(selected_path)
 
     if target_img_path:
         try:
